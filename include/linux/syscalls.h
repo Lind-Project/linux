@@ -1003,6 +1003,22 @@ asmlinkage long sys_lsm_get_self_attr(unsigned int attr, struct lsm_ctx __user *
 asmlinkage long sys_lsm_set_self_attr(unsigned int attr, struct lsm_ctx __user *ctx,
 				      u32 size, u32 flags);
 asmlinkage long sys_lsm_list_modules(u64 __user *ids, u32 __user *size, u32 flags);
+#ifdef CONFIG_THREEI
+asmlinkage long sys_register_handler(pid_t cageid, u32 syscall_nr,
+                                     pid_t grateid, void *handler_addr);
+asmlinkage long sys_make_threei_call(u32 syscall_nr, pid_t primary_cage,
+                                     const s32 __user *user_arg_cage,
+				     const unsigned long __user *user_args);
+asmlinkage long sys_copy_data_between_cages(pid_t src_cage,
+                                            unsigned long src_addr,
+                                            pid_t dst_cage,
+                                            unsigned long dst_addr,
+                                            size_t len);
+asmlinkage long sys_threei_recv(struct threei_req_user __user *req,
+                                unsigned int size);
+asmlinkage long sys_threei_respond(u64 id, long retval);
+asmlinkage long sys_threei_grate_setup(void);
+#endif
 
 /*
  * Architecture-specific system calls

@@ -9,6 +9,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/seccomp.h>
 #include <linux/sched.h>
+#include <linux/threei.h>
 
 #include <asm/entry-common.h>
 #include <asm/syscall.h>
@@ -26,7 +27,8 @@
 				 SYSCALL_WORK_SYSCALL_EMU |		\
 				 SYSCALL_WORK_SYSCALL_AUDIT |		\
 				 SYSCALL_WORK_SYSCALL_USER_DISPATCH |	\
-				 SYSCALL_WORK_SYSCALL_RSEQ_SLICE)
+				 SYSCALL_WORK_SYSCALL_RSEQ_SLICE |	\
+				 SYSCALL_WORK_THREEI)
 /*
  * SYSCALL_WORK flags handled in syscall_exit_to_user_mode()
  */
@@ -104,6 +106,22 @@ static __always_inline long syscall_trace_enter(struct pt_regs *regs, unsigned l
 		if (ret == -1L)
 			return ret;
 	}
+
+#ifdef CONFIG_THREEI
+	if (work & SYSCALL_WORK_THREEI) {
+		unsigned long args[6];
+		long result;
+		long nr = syscall_get_nr(current, regs);
+
+		syscall_get_arguments(current, regs, args);
+		if (threei_entry((u32)nr, args, &result)) {
+			syscall_set_return_value(current, regs, result, 0);
+			return -1L;     /* skip native syscall */
+		}
+		syscall_set_arguments(current, regs, args);
+	}
+#endif
+
 
 	/* Either of the above might have changed the syscall number */
 	syscall = syscall_get_nr(current, regs);

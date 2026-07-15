@@ -111,6 +111,7 @@
 #include <linux/unwind_deferred.h>
 #include <linux/pgalloc.h>
 #include <linux/uaccess.h>
+#include <linux/threei.h>
 
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
@@ -2357,6 +2358,13 @@ __latent_entropy struct task_struct *copy_process(
 #endif
 #ifdef CONFIG_RETHOOK
 	p->rethooks.first = NULL;
+#endif
+
+#ifdef CONFIG_THREEI
+    retval = copy_threei(p);
+    if (retval) {
+        goto bad_fork_cleanup_io;
+    }
 #endif
 
 	/*

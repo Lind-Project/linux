@@ -396,6 +396,12 @@
 469	common	file_setattr		sys_file_setattr
 470	common	listns			sys_listns
 471	common	rseq_slice_yield	sys_rseq_slice_yield
+472	common	register_handler	sys_register_handler
+473	common	make_threei_call	sys_make_threei_call
+474	common	copy_data_between_cages	sys_copy_data_between_cages
+475	common	threei_recv		sys_threei_recv
+476	common	threei_respond		sys_threei_respond
+477 common  threei_grate_setup  sys_threei_grate_setup
 
 #
 # Due to a historical design error, certain syscalls are numbered differently

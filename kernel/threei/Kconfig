@@ -1,0 +1,5 @@
+config THREEI
+	bool "ThreeI Subsystem Core Support."
+	default y
+	help
+	  Enables the ThreeI core subsystem.
