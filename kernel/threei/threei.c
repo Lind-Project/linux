@@ -554,6 +554,9 @@ static long __route_current(u32 syscall_nr, pid_t primary_cage,
     if (have_handler) {
         ret = forward_to_grate(&handler, syscall_nr, primary_cage,
                                arg_cage, args);
+    } else if (primary_cage != 0 && primary_cage != task_tgid_nr(current)
+		    && threei_is_mm_op(syscall_nr)) {
+        ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage, args);
     } else {
         ret = native_syscall(syscall_nr, args);
     }
@@ -677,12 +680,6 @@ bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result) {
     const struct threei_fd_desc *fdesc;
     long verdict;
 
-    fdesc = threei_get_fd_desc(syscall_nr);
-    if (fdesc && (fdesc->flags & THREEI_ARG_IS_FD_MAP)) {
-        threei_gate_map_fd(fdesc, args);
-        return false;
-    }
-
     if (get_handler(syscall_nr, &handler) == 0) {
         verdict = forward_to_grate(&handler, syscall_nr,
                                    task_tgid_nr(current), NULL, args);
@@ -692,6 +689,12 @@ bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result) {
         }
         *result = verdict;
         return true;
+    }
+
+    fdesc = threei_get_fd_desc(syscall_nr);
+    if (fdesc && (fdesc->flags & THREEI_ARG_IS_FD_MAP)) {
+        threei_gate_map_fd(fdesc, args);
+        return false;
     }
 
     if (fdesc && fdesc->arg_is_fd) {

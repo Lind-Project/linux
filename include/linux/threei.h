@@ -196,4 +196,9 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
                             u32 syscall_nr,
                             const struct threei_fd_desc *desc,
                             unsigned long args[6], bool *handled);
+
+bool threei_is_mm_op(u32 nr);
+long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
+                      unsigned long args[6]);
+
 #endif // _LINUX_THREEI_H
