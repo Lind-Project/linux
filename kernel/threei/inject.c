@@ -24,6 +24,12 @@ bool threei_is_thread_op(u32 syscall_nr) {
 #ifdef __NR_execve
     case __NR_execve:
 #endif
+#ifdef __NR_exit
+    case __NR_exit:
+#endif
+#ifdef __NR_exit_group
+    case __NR_exit_group:
+#endif
         return true;
     default:
         return false;
@@ -190,8 +196,9 @@ void threei_notify_resume(struct pt_regs *regs) {
 #ifdef __NR_fork
     case __NR_fork: {
         // struct pt_regs saved;
-	struct kernel_clone_args kargs = {
-            .exit_signal = SIGCHLD,
+        struct kernel_clone_args kargs = {
+            .flags = CLONE_AUTOREAP,
+            .exit_signal = 0,
         };
         /* we don't need to restore regs here since they are never
          * mutated by the kernel_clone() */
@@ -234,6 +241,27 @@ void threei_notify_resume(struct pt_regs *regs) {
         break;
     }
 #endif
+#ifdef __NR_exit
+    case __NR_exit: {
+        int error_code = inj->args[0];
+        inj->ret = 0;
+        inj->active = false;
+        complete(inj->done);
+        threei_inject_put(inj);
+        do_exit((error_code & 0xff) << 8);
+    }
+#endif
+#ifdef __NR_exit_group
+    case __NR_exit_group: {
+        int error_code = inj->args[0];
+        inj->ret = 0;
+        inj->active = false;
+        complete(inj->done);
+        threei_inject_put(inj);
+        do_group_exit((error_code & 0xff) << 8);
+    }
+#endif
+
     default:
         inj->ret = -ENOSYS;
         break;

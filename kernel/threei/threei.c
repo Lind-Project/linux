@@ -1103,12 +1103,12 @@ void threei_exit(struct task_struct *task) {
      * arming grate (waiting in threei_inject_call) so it doesn't hang. */
     inj = task->threei_inject;
     if (inj) {
-	    task->threei_inject = NULL;
-	    if (READ_ONCE(inj->active)) {
-	        inj->ret = -ESRCH;
-		    inj->active = false;
-		    complete(inj->done);
-	    }
+	task->threei_inject = NULL;
+	if (READ_ONCE(inj->active)) {
+	    inj->ret = -ESRCH;
+	    inj->active = false;
+	    complete(inj->done);
+	}
         threei_inject_put(inj);
     }
 
