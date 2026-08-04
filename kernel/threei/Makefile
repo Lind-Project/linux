@@ -1,1 +1,1 @@
-obj-y += threei.o fd.o handler.o mm.o
+obj-y += threei.o fd.o handler.o mm.o inject.o

@@ -555,6 +555,9 @@ static long __route_current(u32 syscall_nr, pid_t primary_cage,
         ret = forward_to_grate(&handler, syscall_nr, primary_cage,
                                arg_cage, args);
     } else if (primary_cage != 0 && primary_cage != task_tgid_nr(current)
+		    && threei_is_thread_op(syscall_nr)) {
+	ret = threei_inject_call(primary_cage, syscall_nr, args);
+    } else if (primary_cage != 0 && primary_cage != task_tgid_nr(current)
 		    && threei_is_mm_op(syscall_nr)) {
         ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage, args);
     } else {
@@ -1056,6 +1059,8 @@ SYSCALL_DEFINE2(threei_respond, u64, id, long, retval) {
 int copy_threei(struct task_struct *p) {
     struct threei_handler *handler;
 
+    /* a fork must never inherit a pending injection */
+    p->threei_inject = NULL;
     /*
      * A grate receive context is per-task and must NOT be inherited: the
      * child is a different task with its own (initially absent) context.
@@ -1092,12 +1097,23 @@ void threei_exit(struct task_struct *task) {
     struct threei_grate_ctx *ctx;
     struct threei_handler *handler;
     struct task_struct *grate;
-    /*
-    pr_info("[threei] exit: pid=%d has_handler=%d\n",
-                                                                    task_pid_nr(task),
-                                                                    task->threei_handler
-    != NULL);
-    */
+    struct threei_inject *inj;
+
+    /* If this task dies with an injected syscall still pending, unblock the
+     * arming grate (waiting in threei_inject_call) so it doesn't hang. */
+    inj = task->threei_inject;
+    if (inj) {
+	    task->threei_inject = NULL;
+	    if (READ_ONCE(inj->active)) {
+	        inj->ret = -ESRCH;
+		    inj->active = false;
+		    complete(inj->done);
+	    }
+        threei_inject_put(inj);
+    }
+
+    task->threei_inject = NULL;
+
     /* before dropping the table, find any registered grate and wake it */
     rcu_read_lock();
     handler = rcu_dereference(task->threei_handler);

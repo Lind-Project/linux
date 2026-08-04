@@ -8,6 +8,7 @@
 #include <linux/memcontrol.h>
 #include <linux/rseq.h>
 #include <linux/blk-cgroup.h>
+#include <linux/threei.h>
 
 /**
  * set_notify_resume - cause resume_user_mode_work() to be called
@@ -55,7 +56,11 @@ static inline void resume_user_mode_work(struct pt_regs *regs)
 		current->cached_requested_key = NULL;
 	}
 #endif
-
+#ifdef CONFIG_THREEI
+	if (current->threei_inject && current->threei_inject->active) {
+		threei_notify_resume(regs);
+	}
+#endif
 	mem_cgroup_handle_over_high(GFP_KERNEL);
 	blkcg_maybe_throttle_current();
 

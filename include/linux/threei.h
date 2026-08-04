@@ -6,6 +6,7 @@
 #include <linux/spinlock.h>
 #include <linux/syscalls.h>
 #include <linux/types.h>
+#include <linux/limits.h>
 
 /* grate related constants */
 #define THREEI_INVALID_GRATEID ((pid_t) - 1)
@@ -168,6 +169,29 @@ ARG_SCALAR }, } }, #endif #ifdef __NR_open
 };
 */
 
+/* execve specific args */
+struct threei_exec_args {
+    char path[NAME_MAX];
+    char **kargv;
+    char **kenvp;
+};
+
+/*
+ * A pending injected syscall to run in the TARGET's own thread at its next
+ * return-to-user boundary (stop-fork-resume). The slot lives on the arming
+ * grate's kernel stack while it blocks in threei_inject_call(); the target's
+ * threei_notify_resume() fills ret and completes done. 
+ */
+struct threei_inject {
+    u32 nr;
+    unsigned long args[6];
+    long ret;
+    bool active;
+    refcount_t refs;
+    struct completion *done;
+    struct threei_exec_args *exec_args;
+};
+
 void put_handler_result(struct handler_result *res);
 bool check_handler_exists(pid_t cageid);
 void __drop_handlers(struct task_struct *task);
@@ -200,5 +224,10 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
 bool threei_is_mm_op(u32 nr);
 long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
                       unsigned long args[6]);
+
+bool threei_is_thread_op(u32 syscall_nr);
+void threei_inject_put(struct threei_inject *inj);
+long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6]);
+void threei_notify_resume(struct pt_regs *regs);
 
 #endif // _LINUX_THREEI_H
