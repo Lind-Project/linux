@@ -1013,7 +1013,8 @@ asmlinkage long sys_copy_data_between_cages(pid_t src_cage,
                                             unsigned long src_addr,
                                             pid_t dst_cage,
                                             unsigned long dst_addr,
-                                            size_t len);
+                                            size_t len,
+					    unsigned long copytype);
 asmlinkage long sys_threei_recv(struct threei_req_user __user *req,
                                 unsigned int size);
 asmlinkage long sys_threei_respond(u64 id, long retval);

@@ -27,6 +27,12 @@
 
 #define THREEI_GENERIC_MAX_BUF (1UL << 20) /* 1 MiB cap per call */
 
+enum threei_copy_type {
+    THREEI_COPY_MEMCPY  = 0,   /* RawMemcpy: exact `len` bytes            */
+    THREEI_COPY_STRNCPY = 1,   /* Strncpy:   NUL-terminated, bounded by len */
+};
+
+
 /* Per-cage virtual fdtable. Have same lifetime as threei_handler */
 struct threei_fdtable {
     spinlock_t lock;
@@ -220,14 +226,23 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
                             u32 syscall_nr,
                             const struct threei_fd_desc *desc,
                             unsigned long args[6], bool *handled);
+int threei_vfd_install_at(struct threei_fdtable *table, int newfd,
+                          struct file *file, pid_t owner_grate);
+inline const struct threei_fd_desc *threei_get_fd_desc(u32 nr);
+long threei_postprocess_fd(struct threei_handler *cage_handler,
+                                  u32 syscall_nr, pid_t grateid,
+                                  int orig_vfd_arg0, long verdict);
+void threei_gate_map_fd(const struct threei_fd_desc *desc,
+                               unsigned long args[6]);
 
-bool threei_is_mm_op(u32 nr);
+	bool threei_is_mm_op(u32 nr);
 long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
                       unsigned long args[6]);
 
 bool threei_is_thread_op(u32 syscall_nr);
 void threei_inject_put(struct threei_inject *inj);
 long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6]);
+
 void threei_notify_resume(struct pt_regs *regs);
 
 #endif // _LINUX_THREEI_H

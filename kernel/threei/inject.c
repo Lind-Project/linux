@@ -197,8 +197,7 @@ void threei_notify_resume(struct pt_regs *regs) {
     case __NR_fork: {
         // struct pt_regs saved;
         struct kernel_clone_args kargs = {
-            .flags = CLONE_AUTOREAP,
-            .exit_signal = 0,
+            .exit_signal = SIGCHLD,
         };
         /* we don't need to restore regs here since they are never
          * mutated by the kernel_clone() */
@@ -235,9 +234,7 @@ void threei_notify_resume(struct pt_regs *regs) {
                                 : empty_envp;
 
         err = kernel_execve(exec_args->path, argv, envp);
-        inj->active = false;
         inj->ret = err;
-        complete(inj->done);
         break;
     }
 #endif
@@ -313,21 +310,25 @@ long threei_inject_call(pid_t target, u32 syscall_nr,
 
 #ifdef __NR_execve
     if (syscall_nr == __NR_execve) {
+        /*
+         * Two callers land here:
+         *  - out-of-band inject: args are GRATE pointers, readable with
+         *    current == grate. Build exec_args; notify_resume will
+         *    kernel_execve them at the target's return-to-user boundary.
+         *  - forwarded execve from a blocked cage: args are CAGE pointers,
+         *    NOT readable here. The build fails; leave exec_args NULL and let
+         *    the forward_via_ring break-out run the cage's native execve.
+         */
         exec_args = threei_exec_args_build(
             (const char __user *)args[0],
             (const char __user *const __user *)args[1],
             (const char __user *const __user *)args[2]);
-        if (IS_ERR(exec_args)) {
-            ret = PTR_ERR(exec_args);
-            exec_args = NULL;
-            kfree(inj);
-            put_task_struct(task);
-            threei_exec_args_free(exec_args);
-            return ret;
-        }
+        if (IS_ERR(exec_args))
+            exec_args = NULL;      /* cage-local forward: native path handles it */
         inj->exec_args = exec_args;
     }
 #endif
+
     /*
      * publish the slot, then force the target to a return-to-user boundary
      */

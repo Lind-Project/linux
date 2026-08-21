@@ -24,12 +24,13 @@ static inline long make_threei_call(__u32 nr, pid_t primary_cage,
 }
 
 static inline long copy_data_between_cages(pid_t src_cage,
-                                           unsigned long src_addr,
-                                           pid_t dst_cage,
-                                           unsigned long dst_addr,
-                                           size_t len) {
+                                              unsigned long src_addr,
+                                              pid_t dst_cage,
+                                              unsigned long dst_addr,
+                                              size_t len,
+                                              unsigned long copytype) {
     return syscall(__NR_copy_data_between_cages, src_cage, src_addr,
-                   dst_cage, dst_addr, len);
+                   dst_cage, dst_addr, len, copytype);
 }
 
 static inline int threei_recv(struct threei_req_user *req) {
@@ -87,14 +88,9 @@ static inline int threei_pin_self(int cpu) {
 */
 
 /*
- * Transparent runtime: state + constructor + spin loop
- */
-
-/*
- * All state and functions are static:  one copy, one
- * constructor invocation, one spin thread. The grate must
- * be single translation unit. (Will be adding support for multiple TUs
- * by introducing threei.h as a libarry)
+ * Transparent runtime: state + constructor + spin loop.
+ * All state and functions are static: one copy, one constructor
+ * invocation, one spin thread. The grate must be a single translation unit.
  */
 static struct threei_ring *__threei_ring;
 static pthread_t __threei_spin_thread;
@@ -121,10 +117,16 @@ static void *__threei_spin_loop(void *arg) {
         for (i = 0; i < (int)ring->nr_slots; i++) {
             struct threei_ring_slot *slot = &ring->slots[i];
 
-            if (atomic_load_explicit((atomic_uint *)&slot->state,
-                                     memory_order_acquire) !=
-                THREEI_SLOT_PENDING) {
-                continue;
+            unsigned expected = THREEI_SLOT_PENDING;
+            /*
+             * Atomically CLAIM the slot (PENDING -> CLAIMED) before handling.
+             * The compare-exchange ensures exactly one dispatch per slot.
+             */
+            if (!atomic_compare_exchange_strong_explicit(
+                    (atomic_uint *)&slot->state, &expected,
+                    THREEI_SLOT_CLAIMED,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                continue;   /* not PENDING, or another pass claimed it */
             }
             found = 1;
             __threei_handle_slot(slot);

@@ -148,7 +148,6 @@ static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
  * grate can dereference them directly. Anything not listed is treated as
  * all-scalar (no marshaling), which is correct for syscalls like geteuid.
  */
-
 /*
 static const struct threei_syscall_desc *threei_get_desc(u32 nr) {
     if (nr < ARRAY_SIZE(threei_descs)) {
@@ -256,15 +255,14 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
     }
 
     /* removed support for automated pointer argument translation */
-
     /*
     ret = threei_marshal_into_slot(slot, nr, args);
     if (ret) {
-                                    smp_store_release(&slot->state,
-    THREEI_SLOT_FREE); *out = ret; return true;
+        smp_store_release(&slot->state, THREEI_SLOT_FREE);
+        *out = ret;
+        return true;
     }
     */
-
     /* publish: CLAIMED -> PENDING */
     smp_store_release(&slot->state, THREEI_SLOT_PENDING);
 
@@ -284,6 +282,35 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                 *out = -EINTR;
                 return true;
             }
+            /* avoid circular wait between the cage and the grate.
+	     * the cage waits for the grate to mark its slot DONE,
+	     * the grate waits for the cage to complete the inject,
+	     * the cage can't complete the inject because it's busy
+	     * waiting for the grate */
+	    {
+                struct threei_inject *inj =
+                    READ_ONCE(current->threei_inject);
+
+		/* the grate has forwarded back to me the very syscall
+		 * I'm currently blocked forwarding */
+                if (inj && READ_ONCE(inj->active) && inj->nr == nr) {
+                    current->threei_inject = NULL;
+                    smp_rmb();
+
+                    /* forwarded args become THIS syscall's args -> regs */
+                    memcpy(args, inj->args, sizeof(inj->args));
+
+                    inj->ret = 0;
+                    inj->active = false;
+                    complete(inj->done); /* release the grate */
+                    threei_inject_put(inj);
+
+                    smp_store_release(&slot->state, THREEI_SLOT_FREE);
+                    *out = THREEI_ALLOW; /* native over args[] */
+                    return true;
+                }
+            }
+
             cond_resched();
         }
     }
@@ -388,117 +415,6 @@ static long forward_to_grate(struct handler_result *handler,
 
 /* FD Translation routine */
 
-/*
- * translate any fd-typed argument from virtual to real before
- * forwarding. need to cover all fd related syscalls
- */
-static const struct threei_fd_desc threei_fd_descs[] = {
-#ifdef __NR_openat
-    [__NR_openat] = {.flags = THREEI_RET_IS_FD},
-#endif
-#ifdef __NR_read
-    [__NR_read] = {.arg_is_fd = 0x01,
-                   .buf = {.ptr_arg = 1,
-                           .len_arg = 2,
-                           .dir = THREEI_BUF_OUT}},
-#endif
-#ifdef __NR_write
-    [__NR_write] = {.arg_is_fd = 0x01,
-                    .buf = {.ptr_arg = 1,
-                            .len_arg = 2,
-                            .dir = THREEI_BUF_IN}},
-#endif
-#ifdef __NR_pread64
-    [__NR_pread64] = {.arg_is_fd = 0x01,
-                      .buf = {.ptr_arg = 1,
-                              .len_arg = 2,
-                              .dir = THREEI_BUF_OUT}},
-#endif
-#ifdef __NR_pwrite64
-    [__NR_pwrite64] = {.arg_is_fd = 0x01,
-                       .buf = {.ptr_arg = 1,
-                               .len_arg = 2,
-                               .dir = THREEI_BUF_IN}},
-#endif
-#ifdef __NR_fstat
-    [__NR_fstat] = {.arg_is_fd = 0x01,
-                    .buf = {.ptr_arg = 1,
-                            .len_arg = THREEI_LEN_FIXED,
-                            .fixed_len = sizeof(struct stat),
-                            .dir = THREEI_BUF_OUT}},
-#endif
-#ifdef __NR_lseek
-    [__NR_lseek] = {.arg_is_fd = 0x01},
-#endif
-#ifdef __NR_close
-    [__NR_close] = {.arg_is_fd = 0x01, .flags = THREEI_FREES_FD0},
-#endif
-#ifdef __NR_mmap
-    [__NR_mmap] = {.flags = THREEI_ARG_IS_FD_MAP, .map_fd = 1 << 4},
-#endif
-};
-
-static inline const struct threei_fd_desc *threei_get_fd_desc(u32 nr) {
-    if (nr < ARRAY_SIZE(threei_fd_descs)) {
-        return &threei_fd_descs[nr];
-    }
-    return NULL;
-}
-
-/* virtualize retval if RET_IS_FD, or free the vfd if FREES_FD0
- * and the free-target arg was already translated */
-static long threei_postprocess_fd(struct threei_handler *cage_handler,
-                                  u32 syscall_nr, pid_t grateid,
-                                  int orig_vfd_arg0, long verdict) {
-    const struct threei_fd_desc *desc = threei_get_fd_desc(syscall_nr);
-    struct threei_fdtable *table;
-
-    if (!desc) {
-        return verdict;
-    }
-
-    if (verdict < 0) {
-        return verdict;
-    }
-
-    if (desc->flags & THREEI_RET_IS_FD) {
-        struct file *file;
-        int grate_fd = (int)verdict;
-        int vfd;
-
-        table = threei_fdtable_get(cage_handler);
-        if (!table) {
-            return -ENOMEM;
-        }
-
-        /* current is the grate here (openat ran native in the grate).
-         * Pin the file*, then close the grate's fd so it doesn't leak. */
-        file = fget(grate_fd);
-        if (!file) {
-            return -EBADF;
-        }
-
-        vfd = threei_vfd_alloc(table, file, task_tgid_nr(current));
-        if (vfd < 0) {
-            fput(file);
-            return -EMFILE;
-        }
-
-        close_fd(grate_fd);
-
-        return vfd;
-    }
-
-    if (desc->flags & THREEI_FREES_FD0) {
-        table = READ_ONCE(cage_handler->fdtable);
-        if (table) {
-            threei_vfd_free(table, orig_vfd_arg0);
-        }
-    }
-
-    return verdict;
-}
-
 /* The shared routing decision, against current's table. */
 static long __route_current(u32 syscall_nr, pid_t primary_cage,
                             const s32 arg_cage[6], unsigned long args[6]) {
@@ -554,11 +470,13 @@ static long __route_current(u32 syscall_nr, pid_t primary_cage,
     if (have_handler) {
         ret = forward_to_grate(&handler, syscall_nr, primary_cage,
                                arg_cage, args);
-    } else if (primary_cage != 0 && primary_cage != task_tgid_nr(current)
-		    && threei_is_thread_op(syscall_nr)) {
-	ret = threei_inject_call(primary_cage, syscall_nr, args);
-    } else if (primary_cage != 0 && primary_cage != task_tgid_nr(current)
-		    && threei_is_mm_op(syscall_nr)) {
+    } else if (primary_cage != 0 &&
+               primary_cage != task_tgid_nr(current) &&
+               threei_is_thread_op(syscall_nr)) {
+        ret = threei_inject_call(primary_cage, syscall_nr, args);
+    } else if (primary_cage != 0 &&
+               primary_cage != task_tgid_nr(current) &&
+               threei_is_mm_op(syscall_nr)) {
         ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage, args);
     } else {
         ret = native_syscall(syscall_nr, args);
@@ -607,62 +525,7 @@ static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd) {
 }
 */
 
-/*
- * Generalized gate handling for THREEI_ARG_IS_FD_MAP syscalls (mmap
- * and any address-space syscall that consumes an fd). current is the
- * cage here.
- *
- * desc->map_fd names which argument holds the vfd (lowest set bit).
- * We look it up in the cage's vfd table, install the real file into
- * the cage's own table, and rewrite that arg to the new real cage fd.
- */
 
-static void threei_gate_map_fd(const struct threei_fd_desc *desc,
-                               unsigned long args[6]) {
-    struct threei_handler *ch;
-    struct threei_fdtable *table;
-    struct file *file;
-    int idx, cage_fd, vfd;
-
-    /* which arg holds the map fd (lowest set bit of map_fd) */
-    if (!desc->map_fd) {
-        return;
-    }
-    idx = __builtin_ffs(desc->map_fd) - 1;
-    if (idx < 0 || idx >= 6) {
-        return;
-    }
-
-    vfd = (int)args[idx];
-    if (vfd < 0) {
-        return;
-    }
-
-    rcu_read_lock();
-    ch = rcu_dereference(current->threei_handler);
-    rcu_read_unlock();
-    if (!ch) {
-        return;
-    }
-
-    table = READ_ONCE(ch->fdtable);
-    if (!table) {
-        return;
-    }
-
-    file = threei_vfd_lookup(table, vfd);
-    if (!file) {
-        return;
-    }
-
-    cage_fd = get_unused_fd_flags(0);
-    if (cage_fd < 0) {
-        return;
-    }
-    get_file(file);
-    fd_install(cage_fd, file);
-    args[idx] = (unsigned long)cage_fd;
-}
 
 /*
  * threei entry gate. all the syscalls made by a cage which has handler
@@ -838,14 +701,18 @@ SYSCALL_DEFINE4(make_threei_call, u32, syscall_nr, pid_t, primary_cage,
  * address spaces via access_process_vm. Neither cage need
  * be the caller (a handler copies a cage's buffers).
  */
-SYSCALL_DEFINE5(copy_data_between_cages, pid_t, src_cage, unsigned long,
+SYSCALL_DEFINE6(copy_data_between_cages, pid_t, src_cage, unsigned long,
                 src_addr, pid_t, dst_cage, unsigned long, dst_addr, size_t,
-                len) {
+                len, unsigned long, copytype) {
     struct task_struct *src_task = NULL, *dst_task = NULL;
     void *buf;
     long copied, ret = 0;
 
     if (!len || len > THREEI_MAX_COPY) {
+        return -EINVAL;
+    }
+    if (copytype != THREEI_COPY_MEMCPY &&
+        copytype != THREEI_COPY_STRNCPY) {
         return -EINVAL;
     }
 
@@ -870,14 +737,51 @@ SYSCALL_DEFINE5(copy_data_between_cages, pid_t, src_cage, unsigned long,
         goto out;
     }
 
-    copied = access_process_vm(src_task, src_addr, buf, len, 0);
-    if (copied != (long)len) {
-        ret = -EFAULT;
-        goto out;
-    }
-    copied = access_process_vm(dst_task, dst_addr, buf, len, FOLL_WRITE);
-    if (copied != (long)len) {
-        ret = -EFAULT;
+    if (copytype == THREEI_COPY_MEMCPY) {
+        /* RawMemcpy: exact-length, all-or-nothing (UNCHANGED) */
+        copied = access_process_vm(src_task, src_addr, buf, len, 0);
+        if (copied != (long)len) {
+            ret = -EFAULT;
+            goto out;
+        }
+        copied =
+            access_process_vm(dst_task, dst_addr, buf, len, FOLL_WRITE);
+        if (copied != (long)len) {
+            ret = -EFAULT;
+        }
+    } else {
+        /* Strncpy: NUL-terminated within len, short-read tolerant
+         * access_process_vm returns the bytes actually readable,
+         * which is < len when the source range runs into an unmapped page
+         * (the stack-edge case that made a fixed-len read EFAULT on a
+         * short path). Scan the readable prefix for '\0'; copy strlen+1
+         * (including the terminator). */
+        size_t slen;
+
+        copied = access_process_vm(src_task, src_addr, buf, len, 0);
+        if (copied <= 0) {
+            ret = -EFAULT; /* not even the first byte readable */
+            goto out;
+        }
+
+        slen = strnlen(buf, copied);
+        if (slen == (size_t)copied) {
+            /* no '\0' within the readable prefix / within len: like lind's
+             * "null terminator not found within max length" */
+            ret = -ENAMETOOLONG;
+            goto out;
+        }
+
+        slen += 1; /* include '\0' (lind: n + 1) */
+
+        copied =
+            access_process_vm(dst_task, dst_addr, buf, slen, FOLL_WRITE);
+        if (copied != (long)slen) {
+            ret = -EFAULT;
+            goto out;
+        }
+
+        ret = (long)slen; /* bytes copied, including '\0' */
     }
 
 out:
@@ -1099,16 +1003,17 @@ void threei_exit(struct task_struct *task) {
     struct task_struct *grate;
     struct threei_inject *inj;
 
-    /* If this task dies with an injected syscall still pending, unblock the
-     * arming grate (waiting in threei_inject_call) so it doesn't hang. */
+    /* If this task dies with an injected syscall still pending, unblock
+     * the arming grate (waiting in threei_inject_call) so it doesn't hang.
+     */
     inj = task->threei_inject;
     if (inj) {
-	task->threei_inject = NULL;
-	if (READ_ONCE(inj->active)) {
-	    inj->ret = -ESRCH;
-	    inj->active = false;
-	    complete(inj->done);
-	}
+        task->threei_inject = NULL;
+        if (READ_ONCE(inj->active)) {
+            inj->ret = -ESRCH;
+            inj->active = false;
+            complete(inj->done);
+        }
         threei_inject_put(inj);
     }
 
