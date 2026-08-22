@@ -89,7 +89,6 @@ long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
                 (arg_cage && arg_cage[4]) ? arg_cage[4] : target_cage;
             int fd = (int)args[4];
             struct task_struct *fd_task;
-            struct threei_handler *handler;
             struct threei_fdtable *fdtable;
 
             fd_task = find_get_task_by_vpid(fd_cage);
@@ -98,24 +97,31 @@ long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
                 break;
             }
 
-            rcu_read_lock();
-            handler = rcu_dereference(fd_task->threei_handler);
-            rcu_read_unlock();
-
-            fdtable = handler ? READ_ONCE(handler->fdtable) : NULL;
+            fdtable = threei_fdtable_lookup_get(fd_task);
             if (fdtable) {
-                /* borrowed file struct */
                 file = threei_vfd_lookup(fdtable, fd);
+                if (file) {
+                    /* increment ref count to file */
+                    get_file(file);
+                }
+                threei_fdtable_put(fdtable);
             }
 
-            if (file) {
-                /* increment ref count to file */
-                get_file(file);
-            } else {
-                /* real fd table + ref */
+            if (!file) {
+                /* real fdtable + ref */
                 file = fget_task(fd_task, fd);
             }
             put_task_struct(fd_task);
+
+            /*
+             * neither table had it. vm_mmap(NULL, ...) without
+             * MAP_ANONYMOUS is not a file mapping, and the fput() below would
+             * dereference NULL. Fail cleanly instead.
+             */
+            if (!file) {
+                ret = -EBADF;
+                break;
+            }
         }
 
         ret = vm_mmap(file, args[0], args[1], args[2], flags, args[5]);

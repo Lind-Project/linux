@@ -1,6 +1,8 @@
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/sched/mm.h>
 #include <linux/threei.h>
 
 static const struct threei_fd_desc threei_fd_descs[] = {
@@ -54,16 +56,22 @@ static const struct threei_fd_desc threei_fd_descs[] = {
     [__NR_ftruncate] = {.arg_is_fd = 0x01},
 #endif
 #ifdef __NR_fcntl
-    [__NR_fcntl]     = {.arg_is_fd = 0x01},
+    [__NR_fcntl] = {.arg_is_fd = 0x01},
+#endif
+#ifdef __NR_fsync
+    [__NR_fsync] = {.arg_is_fd = 0x01},
+#endif
+#ifdef __NR_fdatasync
+    [__NR_fdatasync] = {.arg_is_fd = 0x01},
 #endif
 #ifdef __NR_readv
-    /* readv(fd, iov, iovcnt): fd@0, iov@1 is a NESTED pointer array; the flat
-     * buf descriptor can't express it, so buf stays NONE and the switch case
-     * marshals the iovec explicitly. */
-    [__NR_readv]     = {.arg_is_fd = 0x01},
+    /* readv(fd, iov, iovcnt): fd@0, iov@1 is a NESTED pointer array; the
+     * flat buf descriptor can't express it, so buf stays NONE and the
+     * switch case marshals the iovec explicitly. */
+    [__NR_readv] = {.arg_is_fd = 0x01},
 #endif
 #ifdef __NR_writev
-    [__NR_writev]    = {.arg_is_fd = 0x01},
+    [__NR_writev] = {.arg_is_fd = 0x01},
 #endif
 #ifdef __NR_dup2
     [__NR_dup2] = {.arg_is_fd = 0x01},
@@ -84,19 +92,119 @@ inline const struct threei_fd_desc *threei_get_fd_desc(u32 nr) {
     return NULL;
 }
 
+static struct threei_fdtable *threei_fdtable_alloc(void) {
+    struct threei_fdtable *fdtable = kzalloc(sizeof(*fdtable), GFP_KERNEL);
+
+    if (!fdtable) {
+        return NULL;
+    }
+    spin_lock_init(&fdtable->lock);
+    refcount_set(&fdtable->refs, 1);
+    return fdtable;
+}
+
+/* resolve the cage's table, creating it on the first use. cage == NULL
+ * means current. returns a borrowed pointer (caller must be the cage or
+ * hold the task pinned and not sleep past it). use
+ * threei_fdtable_lookup_get() when the caller is a grate forwarding a call
+ * for someone else */
+struct threei_fdtable *
+threei_fdtable_get_or_create(struct task_struct *cage) {
+    struct threei_fdtable *fdtable, *fresh;
+
+    if (!cage) {
+        cage = current;
+    }
+
+    fdtable = rcu_dereference_raw(cage->threei_fdtable);
+    if (fdtable) {
+        return fdtable;
+    }
+
+    fresh = threei_fdtable_alloc();
+    if (!fresh) {
+        return NULL;
+    }
+
+    task_lock(cage);
+    fdtable = rcu_dereference_protected(
+        cage->threei_fdtable, lockdep_is_held(&cage->alloc_lock));
+
+    if (fdtable) {
+        task_unlock(cage);
+        kfree(fresh);
+        return fdtable;
+    }
+    rcu_assign_pointer(cage->threei_fdtable, fresh);
+    task_unlock(cage);
+    return fresh;
+}
+
+/* pinned lookup for a grate operating on a cage that may exit conncurently
+ */
+struct threei_fdtable *
+threei_fdtable_lookup_get(struct task_struct *cage) {
+    struct threei_fdtable *fdtable;
+
+    rcu_read_lock();
+    fdtable = rcu_dereference(cage->threei_fdtable);
+    if (fdtable && !refcount_inc_not_zero(&fdtable->refs)) {
+        fdtable = NULL;
+    }
+    rcu_read_unlock();
+    return fdtable;
+}
+
+void threei_fdtable_put(struct threei_fdtable *fdtable) {
+    int i;
+
+    if (!fdtable || !refcount_dec_and_test(&fdtable->refs)) {
+        return;
+    }
+
+    /* every populated slot holds a get_file() reference, including the
+     * inherited stdio slots, which threei_vfd_install also ref'd. Drop
+     * them all uniformly. the grate's own fd table still holds its own
+     * references*/
+    for (i = 0; i < THREEI_VFD_MAX; i++) {
+        if (fdtable->file[i]) {
+            fput(fdtable->file[i]);
+            fdtable->file[i] = NULL;
+        }
+    }
+    kfree(fdtable);
+}
+
+struct threei_fdtable *threei_fdtable_clone(struct threei_fdtable *src) {
+    struct threei_fdtable *dst;
+    int i;
+
+    dst = threei_fdtable_alloc();
+    if (!dst) {
+        return NULL;
+    }
+
+    spin_lock(&src->lock);
+    for (i = 0; i < THREEI_VFD_MAX; i++) {
+        if (src->file[i]) {
+            get_file(src->file[i]);
+            dst->file[i] = src->file[i];
+            dst->owner_grate[i] = src->owner_grate[i];
+        }
+    }
+    spin_unlock(&src->lock);
+    return dst;
+}
+
 /* virtualize retval if RET_IS_FD, or free the vfd if FREES_FD0
  * and the free-target arg was already translated */
-long threei_postprocess_fd(struct threei_handler *cage_handler,
-                                  u32 syscall_nr, pid_t grateid,
-                                  int orig_vfd_arg0, long verdict) {
+long threei_postprocess_fd(struct task_struct *cage_task, u32 syscall_nr,
+                           pid_t grateid, int orig_vfd_arg0,
+                           long verdict) {
     const struct threei_fd_desc *desc = threei_get_fd_desc(syscall_nr);
     struct threei_fdtable *table;
 
-    if (!desc) {
-        return verdict;
-    }
-
-    if (verdict < 0) {
+    if (!desc || verdict < 0) {
         return verdict;
     }
 
@@ -105,7 +213,7 @@ long threei_postprocess_fd(struct threei_handler *cage_handler,
         int grate_fd = (int)verdict;
         int vfd;
 
-        table = threei_fdtable_get(cage_handler);
+        table = threei_fdtable_get_or_create(cage_task);
         if (!table) {
             return -ENOMEM;
         }
@@ -120,61 +228,21 @@ long threei_postprocess_fd(struct threei_handler *cage_handler,
         vfd = threei_vfd_alloc(table, file, task_tgid_nr(current));
         if (vfd < 0) {
             fput(file);
+            close_fd(grate_fd);
             return -EMFILE;
         }
-
         close_fd(grate_fd);
-
         return vfd;
     }
 
     if (desc->flags & THREEI_FREES_FD0) {
-        table = READ_ONCE(cage_handler->fdtable);
+        table = cage_task ? rcu_dereference_raw(cage_task->threei_fdtable)
+                          : rcu_dereference_raw(current->threei_fdtable);
         if (table) {
             threei_vfd_free(table, orig_vfd_arg0);
         }
     }
-
     return verdict;
-}
-
-
-struct threei_fdtable *threei_fdtable_get(struct threei_handler *handler) {
-    struct threei_fdtable *table, *fresh;
-    int i;
-
-    table = READ_ONCE(handler->fdtable);
-    if (table) {
-        return table;
-    }
-
-    fresh = kzalloc(sizeof(*fresh), GFP_KERNEL);
-    if (!fresh) {
-        return NULL;
-    }
-    spin_lock_init(&fresh->lock);
-    for (i = 0; i < THREEI_VFD_MAX; i++) {
-        fresh->file[i] = NULL;
-        fresh->owner_grate[i] = 0;
-    }
-
-    /*
-     * Identity-map inherited stdio (0,1,2) so the cage's very first
-     * write()/read() to stdout/stdin/stderr works without ever having
-     * gone through openat. owner_grate == THREEI_VFD_INHERITED marks
-     * these as "not ours to close" during teardown.
-     */
-    for (i = 0; i < 3; i++) {
-        fresh->owner_grate[i] = THREEI_VFD_INHERITED;
-    }
-
-    /* racing allocators: whichever cmpxchg wins is used; loser is freed */
-    if (cmpxchg(&handler->fdtable, NULL, fresh) != NULL) {
-        kfree(fresh);
-        return READ_ONCE(handler->fdtable);
-    }
-
-    return fresh;
 }
 
 int threei_vfd_alloc(struct threei_fdtable *table, struct file *file,
@@ -195,7 +263,7 @@ int threei_vfd_alloc(struct threei_fdtable *table, struct file *file,
 }
 
 int threei_vfd_install_at(struct threei_fdtable *table, int newfd,
-		struct file *file, pid_t owner_grate) {
+                          struct file *file, pid_t owner_grate) {
     struct file *target;
 
     if (newfd < 0 || newfd >= THREEI_VFD_MAX) {
@@ -215,6 +283,40 @@ int threei_vfd_install_at(struct threei_fdtable *table, int newfd,
     }
 
     return newfd;
+}
+
+/*
+ * install the grate's stdio into the cage's vfd table. must be
+ * called with current == grate (fget resolves against current),
+ * i.e. from register_handler.
+ *
+ * the cage inherited 0/1/2 from the grate across fork(), so the
+ * grate's descriptors are the same underlying files.
+ */
+void threei_vfd_install_stdio(struct threei_fdtable *table) {
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        struct file *file;
+
+        /* don't clobber a slot someone already populated */
+        spin_lock(&table->lock);
+        if (table->file[i]) {
+            spin_unlock(&table->lock);
+            continue;
+        }
+        spin_unlock(&table->lock);
+
+        /* curent == grate */
+        file = fget(i);
+        if (!file) {
+            /* grate has no such descriptor */
+            continue;
+        }
+
+        threei_vfd_install_at(table, i, file, THREEI_VFD_INHERITED);
+        fput(file);
+    }
 }
 
 /* returns the pinned struct file* (borrowed), or NULL if vfd is not a
@@ -249,6 +351,7 @@ void threei_vfd_free(struct threei_fdtable *table, int vfd) {
 
 void threei_fdtable_teardown(struct threei_fdtable *table) {
     int i;
+
     if (!table) {
         return;
     }
@@ -256,10 +359,45 @@ void threei_fdtable_teardown(struct threei_fdtable *table) {
     for (i = 0; i < THREEI_VFD_MAX; i++) {
         if (table->file[i]) {
             fput(table->file[i]);
-            table->file[i] = NULL;
         }
+        table->file[i] = NULL;
     }
     kfree(table);
+}
+
+/*
+ * Copy len bytes from the cage's user address 'uaddr' into kbuf.
+ * cage_task == NULL means current is the cage -> ordinary copy_from_user.
+ * Returns 0 or -EFAULT.
+ */
+static long threei_fd_copy_in(struct task_struct *cage_task,
+                              unsigned long uaddr, void *kbuf,
+                              size_t len) {
+    if (!len) {
+        return 0;
+    }
+    if (!cage_task) {
+        return copy_from_user(kbuf, (void __user *)uaddr, len) ? -EFAULT
+                                                               : 0;
+    }
+    return access_process_vm(cage_task, uaddr, kbuf, len, 0) == (long)len
+               ? 0
+               : -EFAULT;
+}
+
+static long threei_fd_copy_out(struct task_struct *cage_task,
+                               unsigned long uaddr, const void *kbuf,
+                               size_t len) {
+    if (!len) {
+        return 0;
+    }
+    if (!cage_task) {
+        return copy_to_user((void __user *)uaddr, kbuf, len) ? -EFAULT : 0;
+    }
+    return access_process_vm(cage_task, uaddr, (void *)kbuf, len,
+                             FOLL_WRITE) == (long)len
+               ? 0
+               : -EFAULT;
 }
 
 /* Run one fd syscall generically against the grate's file*, with isolation
@@ -271,11 +409,10 @@ void threei_fdtable_teardown(struct threei_fdtable *table) {
  * Returns the syscall result, or negative errno. Sets *handled=true if
  * this routine took responsibility for the syscall.
  */
-long threei_generic_fd_exec(struct threei_handler *cage_handler,
-                            u32 syscall_nr,
+long threei_generic_fd_exec(struct task_struct *cage_task, u32 syscall_nr,
                             const struct threei_fd_desc *desc,
                             unsigned long args[6], bool *handled) {
-    struct threei_fdtable *fdtable;
+    struct threei_fdtable *fdtable = NULL;
     struct file *file = NULL;
     void *kbuf = NULL;
     int fd_idx, vfd;
@@ -296,13 +433,17 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
 
     vfd = (int)args[fd_idx];
 
-    fdtable = READ_ONCE(cage_handler->fdtable);
+    fdtable = cage_task ? threei_fdtable_lookup_get(cage_task)
+                        : rcu_dereference_raw(current->threei_fdtable);
     if (!fdtable) {
         return 0;
     }
 
     file = threei_vfd_lookup(fdtable, vfd);
     if (!file) {
+        if (cage_task) {
+            threei_fdtable_put(fdtable);
+        }
         return 0;
     }
 
@@ -331,9 +472,9 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
 
     /* IN buffers (write): copy cage -> kbuf BEFORE the op */
     if (desc->buf.dir == THREEI_BUF_IN && len) {
-        if (copy_from_user(kbuf, (void __user *)args[desc->buf.ptr_arg],
-                           len)) {
-            ret = -EFAULT;
+        ret = threei_fd_copy_in(cage_task, args[desc->buf.ptr_arg], kbuf,
+                                len);
+        if (ret) {
             goto out;
         }
     }
@@ -403,10 +544,8 @@ long threei_generic_fd_exec(struct threei_handler *cage_handler,
         ust.st_ctime = kst.ctime.tv_sec;
         ust.st_ctime_nsec = kst.ctime.tv_nsec;
 
-        if (copy_to_user((void __user *)args[desc->buf.ptr_arg], &ust,
-                         sizeof(ust))) {
-            ret = -EFAULT;
-        }
+        ret = threei_fd_copy_out(cage_task, args[desc->buf.ptr_arg], &ust,
+                                 sizeof(ust));
 
         goto out;
     }
@@ -538,11 +677,12 @@ not
                 goto out;
             }
         }
-        if (copy_from_user(kiov, (void __user *)args[1],
-                           iovcnt * sizeof(struct iovec))) {
-            ret = -EFAULT;
+        ret = threei_fd_copy_in(cage_task, args[1], kiov,
+                                iovcnt * sizeof(struct iovec));
+        if (ret) {
             goto iov_free;
         }
+
         for (i = 0; i < iovcnt; i++) {
             void __user *ubase = (void __user *)kiov[i].iov_base;
             size_t ilen = kiov[i].iov_len;
@@ -562,7 +702,8 @@ not
             }
 
             if (is_write) {
-                if (copy_from_user(bb, ubase, ilen)) {
+                if (threei_fd_copy_in(cage_task, (unsigned long)ubase, bb,
+                                      ilen)) {
                     kvfree(bb);
                     ret = total ? total : -EFAULT;
                     goto iov_free;
@@ -570,7 +711,8 @@ not
                 n = kernel_write(file, bb, ilen, &pos);
             } else {
                 n = kernel_read(file, bb, ilen, &pos);
-                if (n > 0 && copy_to_user(ubase, bb, n)) {
+                if (n > 0 && threei_fd_copy_out(
+                                 cage_task, (unsigned long)ubase, bb, n)) {
                     kvfree(bb);
                     ret = total ? total : -EFAULT;
                     goto iov_free;
@@ -603,9 +745,10 @@ not
         int newfd = (int)args[1];
         pid_t owner;
 
-        /* `file` is oldfd's file*: generic_fd_exec already looked it up via
-        * arg_is_fd=0x01 (and if oldfd was invalid, lookup returned NULL and we
-        * never reached this case -> caller gets the unhandled/EBADF path). */
+        /* `file` is oldfd's file*: generic_fd_exec already looked it up
+         * via arg_is_fd=0x01 (and if oldfd was invalid, lookup returned
+         * NULL and we never reached this case -> caller gets the
+         * unhandled/EBADF path). */
         if (newfd < 0 || newfd >= THREEI_VFD_MAX) {
             ret = -EBADF;
             goto out;
@@ -615,8 +758,8 @@ not
             unsigned int flags = (unsigned int)args[2];
 
             /* dup3: only O_CLOEXEC is allowed, and oldfd==newfd is EINVAL.
-             * (The vfd table does not track per-fd CLOEXEC, so O_CLOEXEC is
-             * accepted but not stored -  TODO.) */
+             * (The vfd table does not track per-fd CLOEXEC, so O_CLOEXEC
+             * is accepted but not stored -  TODO.) */
             if (flags & ~O_CLOEXEC) {
                 ret = -EINVAL;
                 goto out;
@@ -626,8 +769,8 @@ not
                 goto out;
             }
         } else {
-            /* dup2: if oldfd == newfd, it's a no-op returning newfd (oldfd is
-             * already known valid since we have `file`). */
+            /* dup2: if oldfd == newfd, it's a no-op returning newfd (oldfd
+             * is already known valid since we have `file`). */
             if (oldfd == newfd) {
                 ret = newfd;
                 goto out;
@@ -639,6 +782,15 @@ not
         spin_unlock(&fdtable->lock);
 
         ret = threei_vfd_install_at(fdtable, newfd, file, owner);
+        goto out;
+    }
+#endif
+#if defined(__NR_fsync) || defined(__NR_fdatasync)
+    case __NR_fsync:
+    case __NR_fdatasync: {
+        int datasync = (syscall_nr == __NR_fdatasync);
+
+        ret = vfs_fsync(file, datasync);
         goto out;
     }
 #endif
@@ -656,18 +808,20 @@ not
         if (n > len) {
             n = len;
         }
-        if (copy_to_user((void __user *)args[desc->buf.ptr_arg], kbuf,
-                         n)) {
-            ret = -EFAULT;
+        long e = threei_fd_copy_out(cage_task, args[desc->buf.ptr_arg],
+                                    kbuf, n);
+        if (e) {
+            ret = e;
             goto out;
         }
     }
-
 out:
     if (kbuf) {
         kvfree(kbuf);
     }
-
+    if (cage_task) {
+        threei_fdtable_put(fdtable);
+    }
     return ret;
 }
 
@@ -681,8 +835,7 @@ out:
  * the cage's own table, and rewrite that arg to the new real cage fd.
  */
 void threei_gate_map_fd(const struct threei_fd_desc *desc,
-                               unsigned long args[6]) {
-    struct threei_handler *ch;
+                        unsigned long args[6]) {
     struct threei_fdtable *table;
     struct file *file;
     int idx, cage_fd, vfd;
@@ -701,14 +854,7 @@ void threei_gate_map_fd(const struct threei_fd_desc *desc,
         return;
     }
 
-    rcu_read_lock();
-    ch = rcu_dereference(current->threei_handler);
-    rcu_read_unlock();
-    if (!ch) {
-        return;
-    }
-
-    table = READ_ONCE(ch->fdtable);
+    table = rcu_dereference_raw(current->threei_fdtable);
     if (!table) {
         return;
     }

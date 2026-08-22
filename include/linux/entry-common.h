@@ -115,7 +115,7 @@ static __always_inline long syscall_trace_enter(struct pt_regs *regs, unsigned l
 
 		syscall_get_arguments(current, regs, args);
 		if (threei_entry((u32)nr, args, &result)) {
-			syscall_set_return_value(current, regs, result, 0);
+			syscall_set_return_value(current, regs, 0, result);
 			return -1L;     /* skip native syscall */
 		}
 		syscall_set_arguments(current, regs, args);

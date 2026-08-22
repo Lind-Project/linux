@@ -26,10 +26,6 @@ static void threei_handler_free_rcu(struct rcu_head *rcu) {
     struct threei_handler *handler =
         container_of(rcu, struct threei_handler, rcu);
 
-    if (handler->fdtable) {
-        threei_fdtable_teardown(handler->fdtable);
-    }
-
     kfree(handler);
 }
 
@@ -154,6 +150,13 @@ int threei_register_handler(pid_t cageid, u32 syscall_nr, pid_t grateid,
 
     threei_publish(cage, new);
     task_unlock(cage);
+
+    {
+        struct threei_fdtable *table = threei_fdtable_get_or_create(cage);
+        if (table) {
+            threei_vfd_install_stdio(table);
+        }
+    }
 
     threei_handler_put(old);
     put_task_struct(cage);

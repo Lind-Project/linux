@@ -18,7 +18,7 @@
 /* fd translation */
 #define THREEI_VFD_MAX 256
 
-#define THREEI_VFD_INHERITED 0
+#define THREEI_VFD_INHERITED (pid_t)-1
 
 #define THREEI_BUF_NONE 0
 #define THREEI_BUF_IN 1
@@ -35,6 +35,7 @@ enum threei_copy_type {
 
 /* Per-cage virtual fdtable. Have same lifetime as threei_handler */
 struct threei_fdtable {
+    refcount_t refs;
     spinlock_t lock;
     struct file *file[THREEI_VFD_MAX];
     pid_t owner_grate[THREEI_VFD_MAX];
@@ -92,8 +93,6 @@ struct threei_handler {
 
     /* inner map - attributes grateid with handler address*/
     struct target_map table[NR_syscalls];
-
-    struct threei_fdtable *fdtable;
 };
 
 /* duplicate defination of handler table's inner map.
@@ -216,24 +215,29 @@ void threei_exit(struct task_struct *task);
 
 extern long native_syscall(u32 nr, unsigned long args[6]);
 
-struct threei_fdtable *threei_fdtable_get(struct threei_handler *handler);
+struct threei_fdtable *threei_fdtable_get_or_create(struct task_struct *cage);
+struct threei_fdtable *threei_fdtable_lookup_get(struct task_struct *cage);
+struct threei_fdtable *threei_fdtable_clone(struct threei_fdtable *src);
+void threei_fdtable_put(struct threei_fdtable *fdtable);
+
 int threei_vfd_alloc(struct threei_fdtable *table, struct file *file,
                      pid_t owner_grate);
 struct file *threei_vfd_lookup(struct threei_fdtable *table, int vfd);
 void threei_vfd_free(struct threei_fdtable *table, int vfd);
 void threei_fdtable_teardown(struct threei_fdtable *table);
-long threei_generic_fd_exec(struct threei_handler *cage_handler,
+long threei_generic_fd_exec(struct task_struct *cage_task,
                             u32 syscall_nr,
                             const struct threei_fd_desc *desc,
                             unsigned long args[6], bool *handled);
 int threei_vfd_install_at(struct threei_fdtable *table, int newfd,
                           struct file *file, pid_t owner_grate);
 inline const struct threei_fd_desc *threei_get_fd_desc(u32 nr);
-long threei_postprocess_fd(struct threei_handler *cage_handler,
+long threei_postprocess_fd(struct task_struct *cage_task,
                                   u32 syscall_nr, pid_t grateid,
                                   int orig_vfd_arg0, long verdict);
 void threei_gate_map_fd(const struct threei_fd_desc *desc,
                                unsigned long args[6]);
+void threei_vfd_install_stdio(struct threei_fdtable *table);
 
 	bool threei_is_mm_op(u32 nr);
 long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
