@@ -141,6 +141,16 @@ static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
     return NULL;
 }
 
+/* release the slot only if it is still PENDING. returns true if we
+ * freed it. the caller abandons the forward either way. the return
+ * value only says whether the slot was ours to hand back */
+static inline bool threei_slot_release_if_pending(struct threei_ring_slot *slot) {
+	u32 expected = THREEI_SLOT_PENDING;
+
+	return try_cmpxchg(&slot->state, &expected, THREEI_SLOT_FREE);
+}
+
+
 /*
  * depricated since copy should be only made when requested explicitly.
  * will remove it in the future Only syscalls listed here get their
@@ -222,7 +232,8 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                              unsigned long args[6], long *out) {
     struct threei_ring *ring = ctx->ring;
     struct threei_ring_slot *slot = NULL;
-    int i, spins;
+    int i, spins, rounds = 0;
+    bool grate_claimed = false;
 
     if (!ring || !ctx->ring_uaddr) {
         return false;
@@ -272,12 +283,12 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
         if (++spins >= THREEI_SPIN_BUDGET) {
             spins = 0;
             if (READ_ONCE(ctx->dead)) {
-                smp_store_release(&slot->state, THREEI_SLOT_FREE);
+                threei_slot_release_if_pending(slot);
                 *out = -ESRCH;
                 return true;
             }
             if (fatal_signal_pending(current)) {
-                smp_store_release(&slot->state, THREEI_SLOT_FREE);
+                threei_slot_release_if_pending(slot);
                 *out = -EINTR;
                 return true;
             }
@@ -304,10 +315,17 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                     complete(inj->done); /* release the grate */
                     threei_inject_put(inj);
 
-                    smp_store_release(&slot->state, THREEI_SLOT_FREE);
+                    threei_slot_release_if_pending(slot);
                     *out = THREEI_ALLOW; /* native over args[] */
                     return true;
                 }
+            }
+            if (!grate_claimed && ++rounds >= THREEI_RING_SLOTS) {
+                if (threei_slot_release_if_pending(slot)) {
+                    /* reclaimed: the grate never saw it. safe to resubmit */
+                    return false; /* forward_via_completion */
+                }
+                grate_claimed = true;
             }
 
             cond_resched();
@@ -867,7 +885,7 @@ SYSCALL_DEFINE0(threei_grate_setup) {
     struct threei_grate_ctx *ctx;
     unsigned long uaddr;
 
-    ctx = grate_ctx_get(current);
+    ctx = grate_ctx_get(current->group_leader);
     if (!ctx) {
         return -ENOMEM;
     }
@@ -892,7 +910,7 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
      * block waiting rather than failing.
      */
 
-    ctx = grate_ctx_get(current);
+    ctx = grate_ctx_get(current->group_leader);
     if (!ctx) {
         return -ENOMEM;
     }
@@ -939,7 +957,7 @@ SYSCALL_DEFINE2(threei_respond, u64, id, long, retval) {
     struct threei_request *req;
 
     rcu_read_lock();
-    ctx = rcu_dereference(current->threei_grate_ctx);
+    ctx = rcu_dereference(current->group_leader->threei_grate_ctx);
     rcu_read_unlock();
     if (!ctx) {
         return -EINVAL;

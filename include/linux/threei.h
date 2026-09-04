@@ -15,6 +15,9 @@
 /* ring constant */
 #define THREEI_SPIN_BUDGET 200000
 
+/* total spin budget = THREEI_SPIN_BUDGET + THREEI_RING_ROUNDS */
+#define THREEI_RING_ROUNDS 8
+
 /* fd translation */
 #define THREEI_VFD_MAX 256
 

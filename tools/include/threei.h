@@ -94,6 +94,7 @@ static inline int threei_pin_self(int cpu) {
  */
 static struct threei_ring *__threei_ring;
 static pthread_t __threei_spin_thread;
+static pthread_t __threei_recv_thread;
 static atomic_int __threei_cage_pid = -1;
 static pthread_once_t __threei_once = PTHREAD_ONCE_INIT;
 
@@ -144,6 +145,21 @@ static void *__threei_spin_loop(void *arg) {
     }
 }
 
+static void *__threei_recv_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct threei_req_user req;
+
+        if (threei_recv(&req) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return NULL;
+        }
+        threei_respond(req.id, __threei_dispatch(&req));
+    }
+}
+
 static void __threei_do_init(void) {
     struct threei_ring *ring = threei_grate_setup();
 
@@ -152,6 +168,7 @@ static void __threei_do_init(void) {
     }
     __threei_ring = ring;
     pthread_create(&__threei_spin_thread, NULL, __threei_spin_loop, NULL);
+    pthread_create(&__threei_recv_thread, NULL, __threei_recv_loop, NULL);
 }
 
 __attribute__((constructor)) static void __threei_library_init(void) {
