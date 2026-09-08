@@ -25,6 +25,10 @@ struct threei_req_user {
 #define THREEI_DEREGISTER	((__s32)-1)
 
 /* shared ring (fast path) */
+
+/* total spin budget = THREEI_SPIN_BUDGET + THREEI_RING_ROUNDS */
+#define THREEI_RING_ROUNDS 8
+
 #define THREEI_RING_SLOTS   64
 #define THREEI_SLOT_DATA    512
 

@@ -320,7 +320,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                     return true;
                 }
             }
-            if (!grate_claimed && ++rounds >= THREEI_RING_SLOTS) {
+            if (!grate_claimed && ++rounds >= THREEI_RING_ROUNDS) {
                 if (threei_slot_release_if_pending(slot)) {
                     /* reclaimed: the grate never saw it. safe to resubmit */
                     return false; /* forward_via_completion */
@@ -1078,15 +1078,17 @@ void threei_exit(struct task_struct *task) {
     __drop_handlers(task);
 
     /* 2. Tear down its grate receive context, if it had one. */
-    task_lock(task);
-    ctx = rcu_dereference_protected(task->threei_grate_ctx,
-                                    lockdep_is_held(&task->alloc_lock));
-    rcu_assign_pointer(task->threei_grate_ctx, NULL);
-    fdtable = rcu_dereference_protected(
+    if (task == task->group_leader) {
+        task_lock(task);
+        ctx = rcu_dereference_protected(task->threei_grate_ctx,
+                                        lockdep_is_held(&task->alloc_lock));
+        rcu_assign_pointer(task->threei_grate_ctx, NULL);
+        fdtable = rcu_dereference_protected(
         task->threei_fdtable, lockdep_is_held(&task->alloc_lock));
-    rcu_assign_pointer(task->threei_fdtable, NULL);
-    task_unlock(task);
-    threei_fdtable_put(fdtable);
+        rcu_assign_pointer(task->threei_fdtable, NULL);
+        task_unlock(task);
+        threei_fdtable_put(fdtable);
+    }
 
     if (ctx) {
         struct threei_request *req, *tmp;
