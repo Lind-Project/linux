@@ -37,7 +37,10 @@ static int threei_ring_alloc(struct threei_grate_ctx *ctx) {
 
     ctx->ring = page_address(pages);
     ctx->ring_order = order;
-    ctx->ring->nr_slots = THREEI_RING_SLOTS;
+    ctx->ring->free_mask = (THREEI_RING_SLOTS == 64)
+	                        ? ~0ULL
+	                        : ((1ULL << THREEI_RING_SLOTS) - 1);
+    ctx->ring->pending_mask = 0;
     return 0;
 }
 
@@ -144,12 +147,16 @@ static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
 /* release the slot only if it is still PENDING. returns true if we
  * freed it. the caller abandons the forward either way. the return
  * value only says whether the slot was ours to hand back */
-static inline bool threei_slot_release_if_pending(struct threei_ring_slot *slot) {
-	u32 expected = THREEI_SLOT_PENDING;
-
-	return try_cmpxchg(&slot->state, &expected, THREEI_SLOT_FREE);
+static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx) {
+    /* only the taker of the pending bit owns the request */
+    if (!test_and_clear_bit(idx, (unsigned long *)&ring->pending_mask)) {
+        return false;
+    }
+    WRITE_ONCE(ring->slots[idx].state, THREEI_SLOT_FREE);
+    smp_mb__before_atomic();
+    set_bit(idx, (unsigned long *)&ring->free_mask);
+    return true;
 }
-
 
 /*
  * depricated since copy should be only made when requested explicitly.
@@ -232,7 +239,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                              unsigned long args[6], long *out) {
     struct threei_ring *ring = ctx->ring;
     struct threei_ring_slot *slot = NULL;
-    int i, spins, rounds = 0;
+    int slot_idx, spins, rounds = 0;
     bool grate_claimed = false;
 
     if (!ring || !ctx->ring_uaddr) {
@@ -240,18 +247,22 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
     }
 
     /* claim a FREE slot */
-    for (i = 0; i < ring->nr_slots; i++) {
-        u32 expected = THREEI_SLOT_FREE;
+    for (;;) {
+        u64 free_mask = READ_ONCE(ring->free_mask);
 
-        if (try_cmpxchg(&ring->slots[i].state, &expected,
-                        THREEI_SLOT_CLAIMED)) {
-            slot = &ring->slots[i];
-            break;
+        if (!free_mask) {
+            return false;   /* ring full -> completion path */
         }
+        slot_idx = __ffs64(free_mask);
+        if (test_and_clear_bit(slot_idx, (unsigned long *)&ring->free_mask)) {
+            break;  /* exclusive ownership of this slot */
+        }
+        /* another cage took it between the load and the RMW: retry */
     }
-    if (!slot) {
-        return false; /* ring momentarily full: use slow path */
-    }
+
+    slot = &ring->slots[slot_idx];
+
+    WRITE_ONCE(slot->state, THREEI_SLOT_CLAIMED);
 
     slot->nr = nr;
     slot->handler_addr = (u64)handler->handler_addr;
@@ -273,8 +284,10 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
         return true;
     }
     */
-    /* publish: CLAIMED -> PENDING */
+    /* publish: CLAIMED -> PENDING, then the bit */
     smp_store_release(&slot->state, THREEI_SLOT_PENDING);
+    smp_mb__before_atomic();
+    set_bit(slot_idx, (unsigned long *)&ring->pending_mask);
 
     /* spin for the grate's reply */
     spins = 0;
@@ -283,12 +296,12 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
         if (++spins >= THREEI_SPIN_BUDGET) {
             spins = 0;
             if (READ_ONCE(ctx->dead)) {
-                threei_slot_release_if_pending(slot);
+                threei_slot_reclaim(ring, slot_idx);
                 *out = -ESRCH;
                 return true;
             }
             if (fatal_signal_pending(current)) {
-                threei_slot_release_if_pending(slot);
+                threei_slot_reclaim(ring, slot_idx);
                 *out = -EINTR;
                 return true;
             }
@@ -315,13 +328,13 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                     complete(inj->done); /* release the grate */
                     threei_inject_put(inj);
 
-                    threei_slot_release_if_pending(slot);
+                    threei_slot_reclaim(ring, slot_idx);
                     *out = THREEI_ALLOW; /* native over args[] */
                     return true;
                 }
             }
             if (!grate_claimed && ++rounds >= THREEI_RING_ROUNDS) {
-                if (threei_slot_release_if_pending(slot)) {
+                if (threei_slot_reclaim(ring, slot_idx)) {
                     /* reclaimed: the grate never saw it. safe to resubmit */
                     return false; /* forward_via_completion */
                 }
@@ -332,8 +345,11 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
         }
     }
 
+    /* read the result befor handling the slot back */
     *out = (long)slot->retval;
-    smp_store_release(&slot->state, THREEI_SLOT_FREE);
+    WRITE_ONCE(slot->state, THREEI_SLOT_FREE);
+    smp_mb__before_atomic();
+    set_bit(slot_idx, (unsigned long *)&ring->free_mask);
     return true;
 }
 

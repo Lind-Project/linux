@@ -70,6 +70,8 @@ static inline void __threei_handle_slot(struct threei_ring_slot *slot) {
     */
     threei_handler_fn fn =
         (threei_handler_fn)(unsigned long)slot->handler_addr;
+    atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_CLAIMED,
+	    memory_order_release);
     slot->retval = (long)fn((pid_t)slot->cage, (const int *)slot->arg_cage,
                             (unsigned long *)slot->args);
 
@@ -110,38 +112,40 @@ static int register_handler(pid_t srccage, __u32 nr, pid_t dest_grate,
 
 static void *__threei_spin_loop(void *arg) {
     struct threei_ring *ring = __threei_ring;
+    _Atomic unsigned long long *pending =
+	    (_Atomic unsigned long long *)&ring->pending_mask;
+    unsigned idle = 0;
     (void)arg;
 
     for (;;) {
-        int i, found = 0;
+	unsigned long long mask =
+	atomic_load_explicit(pending, memory_order_acquire);
+	unsigned long long bit;
+	    int i;
 
-        for (i = 0; i < (int)ring->nr_slots; i++) {
-            struct threei_ring_slot *slot = &ring->slots[i];
+	    if (!mask) {
+		__asm__ volatile("pause" ::: "memory");
+		if ((++idle & 0xFFFF) == 0){
+                    pid_t c = (pid_t)atomic_load(&__threei_cage_pid);
 
-            unsigned expected = THREEI_SLOT_PENDING;
-            /*
-             * Atomically CLAIM the slot (PENDING -> CLAIMED) before handling.
-             * The compare-exchange ensures exactly one dispatch per slot.
-             */
-            if (!atomic_compare_exchange_strong_explicit(
-                    (atomic_uint *)&slot->state, &expected,
-                    THREEI_SLOT_CLAIMED,
-                    memory_order_acq_rel, memory_order_acquire)) {
-                continue;   /* not PENDING, or another pass claimed it */
-            }
-            found = 1;
-            __threei_handle_slot(slot);
-        }
-        if (!found) {
-            __asm__ volatile("pause" ::: "memory");
-            {
-                pid_t c = (pid_t)atomic_load(&__threei_cage_pid);
-
-                if (c > 0 && waitpid(c, NULL, WNOHANG) == c) {
-                    return NULL;
+                    if (c > 0 && waitpid(c, NULL, WNOHANG) == c) {
+                        return NULL;
+                    }
                 }
-            }
+            continue;
+	    }
+
+        idle = 0;
+
+        i = __builtin_ctzll(mask);  /* get lowest pending bit slot */
+        bit = 1ULL << i;
+
+        /*  */
+        if (!(atomic_fetch_and_explicit(pending, ~bit, memory_order_acq_rel) & bit)) {
+            continue; /* cage reclamimed it, or a peer won */
         }
+        __threei_handle_slot(&ring->slots[i]);
+
     }
 }
 

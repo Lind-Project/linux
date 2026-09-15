@@ -51,8 +51,12 @@ struct threei_ring_slot {
 };
 
 struct threei_ring {
-    __u32 nr_slots;
-    struct threei_ring_slot slots[THREEI_RING_SLOTS];
+    /* seperate lines: free_mask is cage-only, pending_mask is the hot
+     * bitmap the grate polls continuously. keeping them apart stops a
+     * polling grate from stealing the line a cage is claiming on.*/
+    __u64 free_mask	__attribute__((aligned(64)));
+    __u64 pending_mask	__attribute__((aligned(64)));
+    struct threei_ring_slot slots[THREEI_RING_SLOTS]	__attribute__((aligned(64)));
 };
 
 #endif /* _UAPI_LINUX_THREEI_H */
