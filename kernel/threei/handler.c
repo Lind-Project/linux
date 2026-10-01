@@ -115,6 +115,22 @@ static void threei_publish(struct task_struct *target,
     rcu_assign_pointer(target->threei_handler, new);
 }
 
+static int threei_sched_affinity_set(struct task_struct *task, int cpu) {
+    cpumask_var_t mask;
+    int ret;
+
+    if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
+        return -ENOMEM;
+    }
+
+    cpumask_set_cpu(cpu, mask);
+    ret = set_cpus_allowed_ptr(task, mask);
+
+    free_cpumask_var(mask);
+
+    return ret;
+}
+
 /*
  * register or overwrite a single entry.
  * overwriting preserves one entry per (cage, syscall).
@@ -122,6 +138,7 @@ static void threei_publish(struct task_struct *target,
 int threei_register_handler(pid_t cageid, u32 syscall_nr, pid_t grateid,
                             void *handler_addr) {
     struct task_struct *cage;
+    struct task_struct *grate;
     struct threei_handler *old, *new;
     int ret;
 
@@ -159,7 +176,17 @@ int threei_register_handler(pid_t cageid, u32 syscall_nr, pid_t grateid,
     }
 
     threei_handler_put(old);
+
+    rcu_read_lock();
+    grate = find_task_by_vpid(grateid);
+    int cpu = grate ? task_cpu(grate) : -EINVAL;
+    rcu_read_unlock();
+    if (cpu >= 0) {
+        threei_sched_affinity_set(cage, cpu);
+    }
+
     put_task_struct(cage);
+
     return 0;
 }
 

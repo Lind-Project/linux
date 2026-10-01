@@ -7,13 +7,14 @@
 #include <linux/syscalls.h>
 #include <linux/types.h>
 #include <linux/limits.h>
+#include <linux/sched/clock.h>
 
 /* grate related constants */
 #define THREEI_INVALID_GRATEID ((pid_t) - 1)
 #define THREEI_MAX_COPY (16UL << 20)
 
 /* ring constant */
-#define THREEI_SPIN_BUDGET 200000
+#define THREEI_SPIN_BUDGET 1700
 
 /* fd translation */
 #define THREEI_VFD_MAX 256

@@ -26,9 +26,6 @@ struct threei_req_user {
 
 /* shared ring (fast path) */
 
-/* total spin budget = THREEI_SPIN_BUDGET + THREEI_RING_ROUNDS */
-#define THREEI_RING_ROUNDS 8
-
 #define THREEI_RING_SLOTS   64
 #define THREEI_SLOT_DATA    512
 
@@ -37,6 +34,12 @@ struct threei_req_user {
 #define THREEI_SLOT_CLAIMED 1
 #define THREEI_SLOT_PENDING 2
 #define THREEI_SLOT_DONE    3
+
+/* the grate's idle budget is a different quantity from the cage's spin budget
+ * the cage counts spins waiting for one specific reply, the grate counts polls
+ * with no work at all.
+ */
+#define THREEI_GRATE_IDLE_BUDGET 200000
 
 struct threei_ring_slot {
     __u32   state;
@@ -51,6 +54,7 @@ struct threei_ring_slot {
 };
 
 struct threei_ring {
+    __u32 serviced;
     /* seperate lines: free_mask is cage-only, pending_mask is the hot
      * bitmap the grate polls continuously. keeping them apart stops a
      * polling grate from stealing the line a cage is claiming on.*/

@@ -79,15 +79,13 @@ static inline void __threei_handle_slot(struct threei_ring_slot *slot) {
                           memory_order_release);
 }
 
-/*
-static inline int threei_pin_self(int cpu) {
+static inline void __threei_pin_self(int cpu) {
     cpu_set_t set;
 
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
-    return sched_setaffinity(0, sizeof(set), &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
-*/
 
 /*
  * Transparent runtime: state + constructor + spin loop.
@@ -99,15 +97,54 @@ static pthread_t __threei_spin_thread;
 static pthread_t __threei_recv_thread;
 static atomic_int __threei_cage_pid = -1;
 static pthread_once_t __threei_once = PTHREAD_ONCE_INIT;
+static pthread_once_t __threei_recv_once = PTHREAD_ONCE_INIT;
+static atomic_int __threei_pin_cpu = -1;
+
+static void *__threei_recv_loop(void *arg) {
+    int pinned = -1;
+    (void)arg;
+
+    for (;;) {
+        struct threei_req_user req;
+	int cpu = atomic_load_explicit(&__threei_pin_cpu, memory_order_relaxed);
+
+	if (cpu >= 0 && cpu != pinned) {
+	    __threei_pin_self(cpu);
+	    pinned = cpu;
+	}
+
+        if (threei_recv(&req) < 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                continue;
+            }
+            return NULL;
+        }
+        threei_respond(req.id, __threei_dispatch(&req));
+    }
+}
+
+static void __threei_start_recv(void) {
+    pthread_create(&__threei_recv_thread, NULL, __threei_recv_loop, NULL);
+}
 
 static int register_handler(pid_t srccage, __u32 nr, pid_t dest_grate,
                             unsigned long handler_addr) {
     int expected = -1;
+    int rc;
     atomic_compare_exchange_strong(&__threei_cage_pid, &expected,
                                    (int)srccage);
 
-    return (int)syscall(__NR_register_handler, srccage, nr, dest_grate,
+    rc = (int)syscall(__NR_register_handler, srccage, nr, dest_grate,
                         handler_addr);
+
+#ifndef THREEI_NO_RUNTIME
+
+    if (rc == 0 && dest_grate == getpid()) {
+	    atomic_store_explicit(&__threei_pin_cpu, sched_getcpu(), memory_order_release);
+    }
+
+#endif
+    return rc;
 }
 
 static void *__threei_spin_loop(void *arg) {
@@ -116,6 +153,10 @@ static void *__threei_spin_loop(void *arg) {
 	    (_Atomic unsigned long long *)&ring->pending_mask;
     unsigned idle = 0;
     (void)arg;
+
+    /* announce that this ring now has a poller */
+    atomic_store_explicit((_Atomic unsigned *)&ring->serviced, 1,
+                          memory_order_release);
 
     for (;;) {
 	unsigned long long mask =
@@ -129,9 +170,12 @@ static void *__threei_spin_loop(void *arg) {
                     pid_t c = (pid_t)atomic_load(&__threei_cage_pid);
 
                     if (c > 0 && waitpid(c, NULL, WNOHANG) == c) {
-                        return NULL;
+                        goto stop;
                     }
                 }
+		if (idle >= THREEI_GRATE_IDLE_BUDGET) {
+			goto stop;
+		}
             continue;
 	    }
 
@@ -147,36 +191,44 @@ static void *__threei_spin_loop(void *arg) {
         __threei_handle_slot(&ring->slots[i]);
 
     }
+stop:
+    /*
+     * Tell cages to stop using the ring BEFORE this thread disappears.
+     * Without this they would spin 8x our idle budget on every forward,
+     * forever.
+     */
+    atomic_store_explicit((_Atomic unsigned *)&ring->serviced, 0, memory_order_release);
+    return NULL;
 }
 
-static void *__threei_recv_loop(void *arg) {
-    (void)arg;
-    for (;;) {
-        struct threei_req_user req;
-
-        if (threei_recv(&req) < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return NULL;
-        }
-        threei_respond(req.id, __threei_dispatch(&req));
-    }
-}
 
 static void __threei_do_init(void) {
     struct threei_ring *ring = threei_grate_setup();
+    int cpu;
 
     if (!ring) {
         return;
     }
     __threei_ring = ring;
+
+#ifndef THREEI_NO_PIN
+    cpu = sched_getcpu();
+    __threei_pin_self(cpu);
+    atomic_store_explicit(&__threei_pin_cpu, cpu, memory_order_relaxed);
+#endif
+
     pthread_create(&__threei_spin_thread, NULL, __threei_spin_loop, NULL);
     pthread_create(&__threei_recv_thread, NULL, __threei_recv_loop, NULL);
 }
 
+#ifndef THREEI_NO_RUNTIME
 __attribute__((constructor)) static void __threei_library_init(void) {
     pthread_once(&__threei_once, __threei_do_init);
 }
+#endif
+
+static void *__threei_spin_loop(void *arg) __attribute__((unused));
+static void *__threei_recv_loop(void *arg) __attribute__((unused));
+
 
 #endif /* _TOOLS_THREEI_H */

@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/threei.h>
+#include <linux/threei_types.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
 #include <uapi/linux/threei.h>
@@ -36,6 +37,7 @@ static int threei_ring_alloc(struct threei_grate_ctx *ctx) {
     }
 
     ctx->ring = page_address(pages);
+    ctx->ring->serviced = 0;
     ctx->ring_order = order;
     ctx->ring->free_mask = (THREEI_RING_SLOTS == 64)
 	                        ? ~0ULL
@@ -144,6 +146,112 @@ static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
     return NULL;
 }
 
+static struct threei_grate_ctx *threei_resolve_ctx(pid_t grateid) {
+    struct task_struct *grate;
+    struct threei_grate_ctx *ctx;
+
+    rcu_read_lock();
+    grate = find_task_by_vpid(grateid);
+    if (!grate || (grate->flags & PF_EXITING)) {
+        rcu_read_unlock();
+        return NULL;
+    }
+
+    ctx = rcu_dereference(grate->threei_grate_ctx);
+    if (ctx && !threei_ctx_tryget(ctx)) {
+        /* torn down */
+        ctx = NULL;
+    }
+    if (ctx) {
+        rcu_read_unlock();
+        return ctx;
+    }
+
+    /* edge-case: if grate has no ctx yet, it has not called
+     * threei_recv or threei_grate_setup. grate_ctx_get() allocates with
+     * GFP_KERNEL and may sleep i.e. it cannot run under RCU. we hold task instead */
+    get_task_struct(grate);
+    rcu_read_unlock();
+
+    grate_ctx_get(grate);
+
+    /* pin it */
+    rcu_read_lock();
+    if (!(grate->flags & PF_EXITING)) {
+        ctx = rcu_dereference(grate->threei_grate_ctx);
+        if (ctx && !threei_ctx_tryget(ctx)) {
+            ctx = NULL;
+        }
+    }
+    rcu_read_unlock();
+    put_task_struct(grate);
+    return ctx;
+}
+
+
+/* helpers for caching grate context */
+
+static void threei_cache_drop_slot(struct threei_ctx_cache *ctx_cache, int i) {
+    struct threei_grate_ctx *old = ctx_cache->ctx[i];
+
+    __clear_bit(i, &ctx_cache->valid);
+    ctx_cache->ctx[i] = NULL;
+    ctx_cache->grateid[i] = 0;
+    if (old) {
+        threei_ctx_put(old);
+    }
+}
+
+/* returns the lowest holding grateid or -1 if none */
+static inline int threei_cache_find(const struct threei_ctx_cache *ctx_cache,
+                                    pid_t grateid) {
+    unsigned long mask = ctx_cache->valid;
+
+    while (mask) {
+        int i = __ffs(mask);
+        if (ctx_cache->grateid[i] == grateid) {
+            return i;
+        }
+        /* clear that bit and try the next */
+        mask &= mask -1;
+    }
+    return -1;
+}
+
+/* stores a pinned ctx */
+static void threei_cache_insert(struct threei_ctx_cache *ctx_cache, pid_t grateid,
+                                struct threei_grate_ctx *ctx) {
+    int i;
+
+    if (ctx_cache->valid != THREEI_CTX_CACHE_FULL) {
+        i = ffz(ctx_cache->valid);
+    } else {
+        /* full: only reached with more than THREEI_CTX_CACHE_MAX grates */
+        i = ctx_cache->next;
+        ctx_cache->next = (ctx_cache->next + 1) % THREEI_CTX_CACHE_MAX;
+        threei_cache_drop_slot(ctx_cache, i);
+    }
+    ctx_cache->grateid[i] = grateid;
+    ctx_cache->ctx[i] = ctx;
+    __set_bit(i, &ctx_cache->valid);
+}
+
+static void threei_cache_free(struct task_struct *task) {
+    struct threei_ctx_cache *ctx_cache= task->threei_ctx_cache;
+    unsigned long mask;
+    int i;
+
+    if (!ctx_cache) { return; }
+
+    task->threei_ctx_cache = NULL;
+    mask = ctx_cache->valid;
+    for_each_set_bit(i, &mask, THREEI_CTX_CACHE_MAX) {
+        threei_cache_drop_slot(ctx_cache, i);
+    }
+    kfree(ctx_cache);
+}
+
+
 /* release the slot only if it is still PENDING. returns true if we
  * freed it. the caller abandons the forward either way. the return
  * value only says whether the slot was ours to hand back */
@@ -239,10 +347,16 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                              unsigned long args[6], long *out) {
     struct threei_ring *ring = ctx->ring;
     struct threei_ring_slot *slot = NULL;
-    int slot_idx, spins, rounds = 0;
+    int slot_idx, spins;
     bool grate_claimed = false;
 
     if (!ring || !ctx->ring_uaddr) {
+        return false;
+    }
+
+    /* nobody is polling this ring, so publishing to it would spin the
+     * full budget for nothing. Go straight to the completion path. */
+    if (!READ_ONCE(ring->serviced)) {
         return false;
     }
 
@@ -291,6 +405,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 
     /* spin for the grate's reply */
     spins = 0;
+    u64 deadline = local_clock() + THREEI_SPIN_BUDGET;
     while (smp_load_acquire(&slot->state) != THREEI_SLOT_DONE) {
         cpu_relax();
         if (++spins >= THREEI_SPIN_BUDGET) {
@@ -333,7 +448,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
                     return true;
                 }
             }
-            if (!grate_claimed && ++rounds >= THREEI_RING_ROUNDS) {
+            if (local_clock() > deadline) {
                 if (threei_slot_reclaim(ring, slot_idx)) {
                     /* reclaimed: the grate never saw it. safe to resubmit */
                     return false; /* forward_via_completion */
@@ -377,7 +492,7 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
     }
     list_add_tail(&req.node, &ctx->requests);
     spin_unlock(&ctx->lock);
-    wake_up(&ctx->recv_wq);
+    wake_up_interruptible_sync(&ctx->recv_wq);
 
     ret = wait_for_completion_interruptible(&req.done);
     if (ret) {
@@ -398,43 +513,49 @@ static long forward_to_grate(struct handler_result *handler,
                              u32 syscall_nr, pid_t primary_cage,
                              const s32 arg_cage[6],
                              unsigned long args[6]) {
-    struct task_struct *grate;
+    struct threei_ctx_cache *ctx_cache = current->threei_ctx_cache;
     struct threei_grate_ctx *ctx;
     long ret;
+    int slot;
 
-    rcu_read_lock();
-    grate = find_task_by_vpid(handler->grateid);
-    if (grate) {
-        get_task_struct(grate);
+    BUILD_BUG_ON(THREEI_CTX_CACHE_MAX < 1 || THREEI_CTX_CACHE_MAX >= BITS_PER_LONG);
+
+    /*fast path: grate is cached and alive */
+    if (likely(ctx_cache)) {
+        slot = threei_cache_find(ctx_cache, handler->grateid);
+        if (likely(slot >= 0)) {
+            ctx = ctx_cache->ctx[slot];
+            if (likely(!READ_ONCE(ctx->dead))) {
+                goto forward;
+            }
+            threei_cache_drop_slot(ctx_cache, slot);
+        }
     }
-    rcu_read_unlock();
 
-    if (!grate) {
+    /* slow path (uses find_task_by_vpid) which performs heavy radix tree lookup */
+    ctx = threei_resolve_ctx(handler->grateid);
+    if (!ctx) {
         return -ESRCH;
     }
 
-    ctx = grate_ctx_get(grate);
-    if (!ctx || (grate->flags & PF_EXITING)) {
-        put_task_struct(grate);
-        return -ESRCH;
+    /* first forward, allocate memory */
+    if (unlikely(!ctx_cache)) {
+        ctx_cache = kzalloc(sizeof(*ctx_cache), GFP_KERNEL);
+        current->threei_ctx_cache = ctx_cache;
     }
 
-    /*
-     * Pin the ctx once for the whole forward so neither it nor its ring
-     * pages can be freed while we spin (the spin may cond_resched, so we
-     * cannot stay in an RCU read section). grate_ctx_get returned a ctx
-     * that is live right now, threei_ctx_tryget makes that a counted ref.
-     */
-    if (!threei_ctx_tryget(ctx)) {
-        put_task_struct(grate);
-        return -ESRCH;
+    if (likely(ctx_cache)) {
+        threei_cache_insert(ctx_cache, handler->grateid, ctx);
+        goto forward;
     }
+
+
+    /* these forward calls holds the reference to resolved ctx. we drop it here */
 
     /* fast path: shared ring spin */
     if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
                          args, &ret)) {
         threei_ctx_put(ctx);
-        put_task_struct(grate);
         return ret;
     }
 
@@ -442,8 +563,16 @@ static long forward_to_grate(struct handler_result *handler,
     ret = forward_via_completion(ctx, handler, syscall_nr, primary_cage,
                                  args);
     threei_ctx_put(ctx);
-    put_task_struct(grate);
     return ret;
+
+forward:
+    if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
+                        args, &ret)) {
+        return ret;
+    }
+
+    return forward_via_completion(ctx, handler, syscall_nr, primary_cage,
+                        args);
 }
 
 /* FD Translation routine */
@@ -1005,9 +1134,11 @@ int copy_threei(struct task_struct *p) {
     /*
      * A grate receive context is per-task and must NOT be inherited: the
      * child is a different task with its own (initially absent) context.
-     */
+     *
+     * similar is the case with threei_fdtable and  */
     p->threei_grate_ctx = NULL;
     p->threei_fdtable = NULL;
+    p->threei_ctx_cache = NULL;
 
     rcu_read_lock();
     handler = rcu_dereference(current->threei_handler);
@@ -1052,8 +1183,7 @@ void threei_exit(struct task_struct *task) {
     struct threei_fdtable *fdtable;
 
     /* If this task dies with an injected syscall still pending, unblock
-     * the arming grate (waiting in threei_inject_call) so it doesn't hang.
-     */
+     * the arming grate (waiting in threei_inject_call) so it doesn't hang. */
     inj = task->threei_inject;
     if (inj) {
         task->threei_inject = NULL;
@@ -1067,6 +1197,9 @@ void threei_exit(struct task_struct *task) {
 
     task->threei_inject = NULL;
 
+    /* free  for the cage */
+    threei_cache_free(task);
+
     /* before dropping the table, find any registered grate and wake it */
     rcu_read_lock();
     handler = rcu_dereference(task->threei_handler);
@@ -1078,9 +1211,6 @@ void threei_exit(struct task_struct *task) {
             if (grate) {
                 ctx = rcu_dereference(grate->threei_grate_ctx);
                 if (ctx) {
-                    spin_lock(&ctx->lock);
-                    ctx->dead = true;
-                    spin_unlock(&ctx->lock);
                     wake_up(&ctx->recv_wq);
                 }
             }
