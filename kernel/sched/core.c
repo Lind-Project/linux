@@ -11234,3 +11234,22 @@ void sched_change_end(struct sched_change_ctx *ctx)
 		p->sched_class->prio_changed(rq, p, ctx->prio);
 	}
 }
+
+#include <linux/printk.h>
+#include <linux/syscalls.h>
+//context_switch(struct rq *rq, struct task_struct *prev, struct task_struct *next, struct rq_flags *rf)
+
+SYSCALL_DEFINE1(proc_hop, pid_t, pid)
+{
+	struct rq_flags rf;
+	struct task_struct *next;
+	struct rq *rq;
+	rq = this_rq();
+	pr_info("proc_hop: rq=%lx current=%lx, pid=%lx\n", rq, current, pid);
+	next = pid_task(find_vpid(pid), PIDTYPE_PID);
+	
+	local_irq_disable();
+	rq_lock(rq, &rf);
+    context_switch(rq, current, next, &rf);
+	return 0;
+}
