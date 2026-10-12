@@ -201,7 +201,6 @@ struct threei_inject {
 void put_handler_result(struct handler_result *res);
 bool check_handler_exists(pid_t cageid);
 void __drop_handlers(struct task_struct *task);
-bool check_cage_handler_exists(pid_t cageid);
 int get_handler(u32 syscall_nr, struct handler_result *out);
 void rm_cage_from_handler(pid_t cageid);
 void rm_grate_from_handler(pid_t grateid);
