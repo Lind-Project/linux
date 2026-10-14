@@ -1054,7 +1054,6 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
      * The grate may not have been targeted yet; create its ctx so it can
      * block waiting rather than failing.
      */
-
     ctx = grate_ctx_get(current->group_leader);
     if (!ctx) {
         return -ENOMEM;
@@ -1062,6 +1061,10 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
 
     /* establish the ring on first recv (no-op afterwards) */
     ring_uaddr = threei_create_ring(ctx);
+
+    if (current->policy != SCHED_RR) {
+	threei_promote_grate(current);
+    }
 
     if (wait_event_interruptible(ctx->recv_wq,
                                  has_pending(ctx) || ctx->dead)) {

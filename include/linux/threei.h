@@ -249,4 +249,8 @@ long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6]);
 
 void threei_notify_resume(struct pt_regs *regs);
 
+int  threei_promote_grate(struct task_struct *grate);
+void threei_set_cage_sched(struct task_struct *cage);
+void threei_set_cfs(struct task_struct *task);
+
 #endif // _LINUX_THREEI_H
