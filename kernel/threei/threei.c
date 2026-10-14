@@ -27,43 +27,46 @@
  * @ctx: a reference to the current executing grate ctx struct
  *
  */
-static int threei_ring_alloc(struct threei_grate_ctx *ctx) {
-    unsigned long order = get_order(sizeof(struct threei_ring));
-    struct page *pages;
+static int threei_ring_alloc(struct threei_grate_ctx *ctx)
+{
+	unsigned long order = get_order(sizeof(struct threei_ring));
+	struct page *pages;
 
-    pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-    if (!pages) {
-        return -ENOMEM;
-    }
+	pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+	if (!pages) {
+		return -ENOMEM;
+	}
 
-    ctx->ring = page_address(pages);
-    ctx->ring->serviced = 0;
-    ctx->ring_order = order;
-    ctx->ring->free_mask = (THREEI_RING_SLOTS == 64)
-	                        ? ~0ULL
-	                        : ((1ULL << THREEI_RING_SLOTS) - 1);
-    ctx->ring->pending_mask = 0;
-    return 0;
+	ctx->ring = page_address(pages);
+	ctx->ring->serviced = 0;
+	ctx->ring_order = order;
+	ctx->ring->free_mask = (THREEI_RING_SLOTS == 64) ?
+				       ~0ULL :
+				       ((1ULL << THREEI_RING_SLOTS) - 1);
+	ctx->ring->pending_mask = 0;
+	return 0;
 }
 
 /*
  * threei_ctx_free_rcu - free pages allocated to shared ring and
  * frees object of threei_grate_ctx.
  */
-static void threei_ctx_free_rcu(struct rcu_head *rcu) {
-    struct threei_grate_ctx *ctx =
-        container_of(rcu, struct threei_grate_ctx, rcu);
+static void threei_ctx_free_rcu(struct rcu_head *rcu)
+{
+	struct threei_grate_ctx *ctx =
+		container_of(rcu, struct threei_grate_ctx, rcu);
 
-    if (ctx->ring) {
-        free_pages((unsigned long)ctx->ring, ctx->ring_order);
-    }
-    kfree(ctx);
+	if (ctx->ring) {
+		free_pages((unsigned long)ctx->ring, ctx->ring_order);
+	}
+	kfree(ctx);
 }
 
-static void threei_ctx_put(struct threei_grate_ctx *ctx) {
-    if (refcount_dec_and_test(&ctx->refs)) {
-        call_rcu(&ctx->rcu, threei_ctx_free_rcu);
-    }
+static void threei_ctx_put(struct threei_grate_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->refs)) {
+		call_rcu(&ctx->rcu, threei_ctx_free_rcu);
+	}
 }
 
 /*
@@ -71,199 +74,210 @@ static void threei_ctx_put(struct threei_grate_ctx *ctx) {
  * pinned. Used by the cage before it spins on the ring, so the ctx and
  * ring pages cannot be freed under it.
  */
-static bool threei_ctx_tryget(struct threei_grate_ctx *ctx) {
-    return refcount_inc_not_zero(&ctx->refs);
+static bool threei_ctx_tryget(struct threei_grate_ctx *ctx)
+{
+	return refcount_inc_not_zero(&ctx->refs);
 }
 
 /* per-grate receive context */
-static struct threei_grate_ctx *grate_ctx_alloc(void) {
-    struct threei_grate_ctx *ctx;
+static struct threei_grate_ctx *grate_ctx_alloc(void)
+{
+	struct threei_grate_ctx *ctx;
 
-    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-    if (!ctx) {
-        return NULL;
-    }
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		return NULL;
+	}
 
-    spin_lock_init(&ctx->lock);
-    INIT_LIST_HEAD(&ctx->requests);
-    INIT_LIST_HEAD(&ctx->inflight);
-    init_waitqueue_head(&ctx->recv_wq);
-    atomic64_set(&ctx->next_id, 0);
-    refcount_set(&ctx->refs, 1);
+	spin_lock_init(&ctx->lock);
+	INIT_LIST_HEAD(&ctx->requests);
+	INIT_LIST_HEAD(&ctx->inflight);
+	init_waitqueue_head(&ctx->recv_wq);
+	atomic64_set(&ctx->next_id, 0);
+	refcount_set(&ctx->refs, 1);
 
-    return ctx;
+	return ctx;
 }
 
-static struct threei_grate_ctx *grate_ctx_get(struct task_struct *grate) {
-    struct threei_grate_ctx *ctx, *fresh;
+static struct threei_grate_ctx *grate_ctx_get(struct task_struct *grate)
+{
+	struct threei_grate_ctx *ctx, *fresh;
 
-    rcu_read_lock();
-    ctx = rcu_dereference(grate->threei_grate_ctx);
-    rcu_read_unlock();
-    if (ctx) {
-        return ctx;
-    }
+	rcu_read_lock();
+	ctx = rcu_dereference(grate->threei_grate_ctx);
+	rcu_read_unlock();
+	if (ctx) {
+		return ctx;
+	}
 
-    fresh = grate_ctx_alloc();
-    if (!fresh) {
-        return NULL;
-    }
+	fresh = grate_ctx_alloc();
+	if (!fresh) {
+		return NULL;
+	}
 
-    task_lock(grate);
-    ctx = rcu_dereference_protected(grate->threei_grate_ctx,
-                                    lockdep_is_held(&grate->alloc_lock));
+	task_lock(grate);
+	ctx = rcu_dereference_protected(grate->threei_grate_ctx,
+					lockdep_is_held(&grate->alloc_lock));
 
-    if (ctx) {
-        task_unlock(grate);
-        kfree(fresh);
-        return ctx;
-    }
+	if (ctx) {
+		task_unlock(grate);
+		kfree(fresh);
+		return ctx;
+	}
 
-    rcu_assign_pointer(grate->threei_grate_ctx, fresh);
-    task_unlock(grate);
-    return fresh;
+	rcu_assign_pointer(grate->threei_grate_ctx, fresh);
+	task_unlock(grate);
+	return fresh;
 }
 
-static bool has_pending(struct threei_grate_ctx *ctx) {
-    bool ret;
+static bool has_pending(struct threei_grate_ctx *ctx)
+{
+	bool ret;
 
-    spin_lock(&ctx->lock);
-    ret = !list_empty(&ctx->requests);
-    spin_unlock(&ctx->lock);
-    return ret;
+	spin_lock(&ctx->lock);
+	ret = !list_empty(&ctx->requests);
+	spin_unlock(&ctx->lock);
+	return ret;
 }
 
 static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
-                                            u64 id) {
-    struct threei_request *req;
+					    u64 id)
+{
+	struct threei_request *req;
 
-    list_for_each_entry(req, &ctx->inflight, node) {
-        if (req->id == id) {
-            return req;
-        }
-    }
+	list_for_each_entry(req, &ctx->inflight, node) {
+		if (req->id == id) {
+			return req;
+		}
+	}
 
-    return NULL;
+	return NULL;
 }
 
-static struct threei_grate_ctx *threei_resolve_ctx(pid_t grateid) {
-    struct task_struct *grate;
-    struct threei_grate_ctx *ctx;
+static struct threei_grate_ctx *threei_resolve_ctx(pid_t grateid)
+{
+	struct task_struct *grate;
+	struct threei_grate_ctx *ctx;
 
-    rcu_read_lock();
-    grate = find_task_by_vpid(grateid);
-    if (!grate || (grate->flags & PF_EXITING)) {
-        rcu_read_unlock();
-        return NULL;
-    }
+	rcu_read_lock();
+	grate = find_task_by_vpid(grateid);
+	if (!grate || (grate->flags & PF_EXITING)) {
+		rcu_read_unlock();
+		return NULL;
+	}
 
-    ctx = rcu_dereference(grate->threei_grate_ctx);
-    if (ctx && !threei_ctx_tryget(ctx)) {
-        /* torn down */
-        ctx = NULL;
-    }
-    if (ctx) {
-        rcu_read_unlock();
-        return ctx;
-    }
+	ctx = rcu_dereference(grate->threei_grate_ctx);
+	if (ctx && !threei_ctx_tryget(ctx)) {
+		/* torn down */
+		ctx = NULL;
+	}
+	if (ctx) {
+		rcu_read_unlock();
+		return ctx;
+	}
 
-    /* edge-case: if grate has no ctx yet, it has not called
-     * threei_recv or threei_grate_setup. grate_ctx_get() allocates with
-     * GFP_KERNEL and may sleep i.e. it cannot run under RCU. we hold task instead */
-    get_task_struct(grate);
-    rcu_read_unlock();
+	/* edge-case: if grate has no ctx yet, it has not called
+	* threei_recv or threei_grate_setup. grate_ctx_get() allocates with
+	* GFP_KERNEL and may sleep i.e. it cannot run under RCU. we hold task instead */
+	get_task_struct(grate);
+	rcu_read_unlock();
 
-    grate_ctx_get(grate);
+	grate_ctx_get(grate);
 
-    /* pin it */
-    rcu_read_lock();
-    if (!(grate->flags & PF_EXITING)) {
-        ctx = rcu_dereference(grate->threei_grate_ctx);
-        if (ctx && !threei_ctx_tryget(ctx)) {
-            ctx = NULL;
-        }
-    }
-    rcu_read_unlock();
-    put_task_struct(grate);
-    return ctx;
+	/* pin it */
+	rcu_read_lock();
+	if (!(grate->flags & PF_EXITING)) {
+		ctx = rcu_dereference(grate->threei_grate_ctx);
+		if (ctx && !threei_ctx_tryget(ctx)) {
+			ctx = NULL;
+		}
+	}
+	rcu_read_unlock();
+	put_task_struct(grate);
+	return ctx;
 }
-
 
 /* helpers for caching grate context */
 
-static void threei_cache_drop_slot(struct threei_ctx_cache *ctx_cache, int i) {
-    struct threei_grate_ctx *old = ctx_cache->ctx[i];
+static void threei_cache_drop_slot(struct threei_ctx_cache *ctx_cache, int i)
+{
+	struct threei_grate_ctx *old = ctx_cache->ctx[i];
 
-    __clear_bit(i, &ctx_cache->valid);
-    ctx_cache->ctx[i] = NULL;
-    ctx_cache->grateid[i] = 0;
-    if (old) {
-        threei_ctx_put(old);
-    }
+	__clear_bit(i, &ctx_cache->valid);
+	ctx_cache->ctx[i] = NULL;
+	ctx_cache->grateid[i] = 0;
+	if (old) {
+		threei_ctx_put(old);
+	}
 }
 
 /* returns the lowest holding grateid or -1 if none */
 static inline int threei_cache_find(const struct threei_ctx_cache *ctx_cache,
-                                    pid_t grateid) {
-    unsigned long mask = ctx_cache->valid;
+				    pid_t grateid)
+{
+	unsigned long mask = ctx_cache->valid;
 
-    while (mask) {
-        int i = __ffs(mask);
-        if (ctx_cache->grateid[i] == grateid) {
-            return i;
-        }
-        /* clear that bit and try the next */
-        mask &= mask -1;
-    }
-    return -1;
+	while (mask) {
+		int i = __ffs(mask);
+		if (ctx_cache->grateid[i] == grateid) {
+			return i;
+		}
+		/* clear that bit and try the next */
+		mask &= mask - 1;
+	}
+	return -1;
 }
 
 /* stores a pinned ctx */
-static void threei_cache_insert(struct threei_ctx_cache *ctx_cache, pid_t grateid,
-                                struct threei_grate_ctx *ctx) {
-    int i;
+static void threei_cache_insert(struct threei_ctx_cache *ctx_cache,
+				pid_t grateid, struct threei_grate_ctx *ctx)
+{
+	int i;
 
-    if (ctx_cache->valid != THREEI_CTX_CACHE_FULL) {
-        i = ffz(ctx_cache->valid);
-    } else {
-        /* full: only reached with more than THREEI_CTX_CACHE_MAX grates */
-        i = ctx_cache->next;
-        ctx_cache->next = (ctx_cache->next + 1) % THREEI_CTX_CACHE_MAX;
-        threei_cache_drop_slot(ctx_cache, i);
-    }
-    ctx_cache->grateid[i] = grateid;
-    ctx_cache->ctx[i] = ctx;
-    __set_bit(i, &ctx_cache->valid);
+	if (ctx_cache->valid != THREEI_CTX_CACHE_FULL) {
+		i = ffz(ctx_cache->valid);
+	} else {
+		/* full: only reached with more than THREEI_CTX_CACHE_MAX grates */
+		i = ctx_cache->next;
+		ctx_cache->next = (ctx_cache->next + 1) % THREEI_CTX_CACHE_MAX;
+		threei_cache_drop_slot(ctx_cache, i);
+	}
+	ctx_cache->grateid[i] = grateid;
+	ctx_cache->ctx[i] = ctx;
+	__set_bit(i, &ctx_cache->valid);
 }
 
-static void threei_cache_free(struct task_struct *task) {
-    struct threei_ctx_cache *ctx_cache= task->threei_ctx_cache;
-    unsigned long mask;
-    int i;
+static void threei_cache_free(struct task_struct *task)
+{
+	struct threei_ctx_cache *ctx_cache = task->threei_ctx_cache;
+	unsigned long mask;
+	int i;
 
-    if (!ctx_cache) { return; }
+	if (!ctx_cache) {
+		return;
+	}
 
-    task->threei_ctx_cache = NULL;
-    mask = ctx_cache->valid;
-    for_each_set_bit(i, &mask, THREEI_CTX_CACHE_MAX) {
-        threei_cache_drop_slot(ctx_cache, i);
-    }
-    kfree(ctx_cache);
+	task->threei_ctx_cache = NULL;
+	mask = ctx_cache->valid;
+	for_each_set_bit(i, &mask, THREEI_CTX_CACHE_MAX) {
+		threei_cache_drop_slot(ctx_cache, i);
+	}
+	kfree(ctx_cache);
 }
-
 
 /* release the slot only if it is still PENDING. returns true if we
  * freed it. the caller abandons the forward either way. the return
  * value only says whether the slot was ours to hand back */
-static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx) {
-    /* only the taker of the pending bit owns the request */
-    if (!test_and_clear_bit(idx, (unsigned long *)&ring->pending_mask)) {
-        return false;
-    }
-    WRITE_ONCE(ring->slots[idx].state, THREEI_SLOT_FREE);
-    smp_mb__before_atomic();
-    set_bit(idx, (unsigned long *)&ring->free_mask);
-    return true;
+static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx)
+{
+	/* only the taker of the pending bit owns the request */
+	if (!test_and_clear_bit(idx, (unsigned long *)&ring->pending_mask)) {
+		return false;
+	}
+	WRITE_ONCE(ring->slots[idx].state, THREEI_SLOT_FREE);
+	smp_mb__before_atomic();
+	set_bit(idx, (unsigned long *)&ring->free_mask);
+	return true;
 }
 
 /*
@@ -273,58 +287,64 @@ static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx) {
  * grate can dereference them directly. Anything not listed is treated as
  * all-scalar (no marshaling), which is correct for syscalls like geteuid.
  */
+
 /*
-static const struct threei_syscall_desc *threei_get_desc(u32 nr) {
-    if (nr < ARRAY_SIZE(threei_descs)) {
-        return &threei_descs[nr];
-    }
-    return NULL; // scalrs
+static const struct threei_syscall_desc *threei_get_desc(u32 nr)
+{
+	if (nr < ARRAY_SIZE(threei_descs)) {
+		return &threei_descs[nr];
+	}
+	return NULL; // scalrs
 }
 
 static long threei_marshal_into_slot(struct threei_ring_slot *slot, u32 nr,
-                                     unsigned long args[6]) {
-    const struct threei_syscall_desc *desc = threei_get_desc(nr);
-    u32 off = 0;
-    int i;
+				     unsigned long args[6])
+{
+	const struct threei_syscall_desc *desc = threei_get_desc(nr);
+	u32 off = 0;
+	int i;
 
-    slot->arg_is_ptr = 0;
+	slot->arg_is_ptr = 0;
 
-    for (i = 0; i < 6; i++) {
-        if (desc && desc->args[i].type == ARG_IN_PTR && args[i]) {
-            if (desc->args[i].size == 0) {
-                long n = strncpy_from_user(slot->data + off,
-                                           (void __user *)args[i],
-                                           THREEI_SLOT_DATA - off);
-                if (n < 0) {
-                    return -EFAULT;
-                }
-                if (n >= (long)(THREEI_SLOT_DATA - off)) {
-                    return -E2BIG;
-                }
-                slot->args[i] = off;
-                slot->arg_is_ptr |= (1ULL << i);
-                off += n + 1;
-            } else {
-                u32 sz = desc->args[i].size;
+	for (i = 0; i < 6; i++) {
+		if (desc && desc->args[i].type == ARG_IN_PTR && args[i]) {
+			if (desc->args[i].size == 0) {
+				long n = strncpy_from_user(
+					slot->data + off,
+					(void __user *)args[i],
+					THREEI_SLOT_DATA - off);
+				if (n < 0) {
+					return -EFAULT;
+				}
+				if (n >= (long)(THREEI_SLOT_DATA - off)) {
+					return -E2BIG;
+				}
+				slot->args[i] = off;
+				slot->arg_is_ptr |= (1ULL << i);
+				off += n + 1;
+			} else {
+				u32 sz = desc->args[i].size;
 
-                if (off + sz > THREEI_SLOT_DATA) {
-                    return -E2BIG;
-                }
-                if (copy_from_user(slot->data + off,
-                                   (void __user *)args[i], sz)) {
-                    return -EFAULT;
-                }
-                slot->args[i] = off;
-                slot->arg_is_ptr |= (1ULL << i);
-                off += sz;
-            }
-        } else {
-            slot->args[i] = args[i];
-        }
-    }
-    return 0;
+				if (off + sz > THREEI_SLOT_DATA) {
+					return -E2BIG;
+				}
+				if (copy_from_user(slot->data + off,
+						   (void __user *)args[i],
+						   sz)) {
+					return -EFAULT;
+				}
+				slot->args[i] = off;
+				slot->arg_is_ptr |= (1ULL << i);
+				off += sz;
+			}
+		} else {
+			slot->args[i] = args[i];
+		}
+	}
+	return 0;
 }
 */
+
 /* fast path: shared-ring spin
  *
  * Try to forward via the shared ring. Returns true if the ring path was
@@ -342,353 +362,361 @@ static long threei_marshal_into_slot(struct threei_ring_slot *slot, u32 nr,
  * cannot wedge the cage uninterruptibly.
  */
 static bool forward_via_ring(struct threei_grate_ctx *ctx,
-                             struct handler_result *handler, u32 nr,
-                             pid_t primary_cage, const s32 arg_cage[6],
-                             unsigned long args[6], long *out) {
-    struct threei_ring *ring = ctx->ring;
-    struct threei_ring_slot *slot = NULL;
-    int slot_idx, spins;
-    bool grate_claimed = false;
+			     struct handler_result *handler, u32 nr,
+			     pid_t primary_cage, const s32 arg_cage[6],
+			     unsigned long args[6], long *out)
+{
+	struct threei_ring *ring = ctx->ring;
+	struct threei_ring_slot *slot = NULL;
+	int slot_idx, spins;
+	bool grate_claimed = false;
 
-    if (!ring || !ctx->ring_uaddr) {
-        return false;
-    }
+	if (!ring || !ctx->ring_uaddr) {
+		return false;
+	}
 
-    /* nobody is polling this ring, so publishing to it would spin the
+	/* nobody is polling this ring, so publishing to it would spin the
      * full budget for nothing. Go straight to the completion path. */
-    if (!READ_ONCE(ring->serviced)) {
-        return false;
-    }
+	if (!READ_ONCE(ring->serviced)) {
+		return false;
+	}
 
-    /* claim a FREE slot */
-    for (;;) {
-        u64 free_mask = READ_ONCE(ring->free_mask);
+	/* claim a FREE slot */
+	for (;;) {
+		u64 free_mask = READ_ONCE(ring->free_mask);
 
-        if (!free_mask) {
-            return false;   /* ring full -> completion path */
-        }
-        slot_idx = __ffs64(free_mask);
-        if (test_and_clear_bit(slot_idx, (unsigned long *)&ring->free_mask)) {
-            break;  /* exclusive ownership of this slot */
-        }
-        /* another cage took it between the load and the RMW: retry */
-    }
+		if (!free_mask) {
+			return false; /* ring full -> completion path */
+		}
+		slot_idx = __ffs64(free_mask);
+		if (test_and_clear_bit(slot_idx,
+				       (unsigned long *)&ring->free_mask)) {
+			break; /* exclusive ownership of this slot */
+		}
+		/* another cage took it between the load and the RMW: retry */
+	}
 
-    slot = &ring->slots[slot_idx];
+	slot = &ring->slots[slot_idx];
 
-    WRITE_ONCE(slot->state, THREEI_SLOT_CLAIMED);
+	WRITE_ONCE(slot->state, THREEI_SLOT_CLAIMED);
 
-    slot->nr = nr;
-    slot->handler_addr = (u64)handler->handler_addr;
-    slot->cage = primary_cage;
-    slot->arg_is_ptr = 0;
-    memcpy(slot->args, args, sizeof(slot->args));
-    if (arg_cage) {
-        memcpy(slot->arg_cage, arg_cage, sizeof(slot->arg_cage));
-    } else {
-        memset(slot->arg_cage, 0, sizeof(slot->arg_cage));
-    }
+	slot->nr = nr;
+	slot->handler_addr = (u64)handler->handler_addr;
+	slot->cage = primary_cage;
+	slot->arg_is_ptr = 0;
+	memcpy(slot->args, args, sizeof(slot->args));
+	if (arg_cage) {
+		memcpy(slot->arg_cage, arg_cage, sizeof(slot->arg_cage));
+	} else {
+		memset(slot->arg_cage, 0, sizeof(slot->arg_cage));
+	}
 
-    /* removed support for automated pointer argument translation */
-    /*
-    ret = threei_marshal_into_slot(slot, nr, args);
-    if (ret) {
-        smp_store_release(&slot->state, THREEI_SLOT_FREE);
-        *out = ret;
-        return true;
-    }
-    */
-    /* publish: CLAIMED -> PENDING, then the bit */
-    smp_store_release(&slot->state, THREEI_SLOT_PENDING);
-    smp_mb__before_atomic();
-    set_bit(slot_idx, (unsigned long *)&ring->pending_mask);
+	/* removed support for automated pointer argument translation */
+	/*
+	ret = threei_marshal_into_slot(slot, nr, args);
+	if (ret) {
+		smp_store_release(&slot->state, THREEI_SLOT_FREE);
+		*out = ret;
+		return true;
+	}
+	*/
 
-    /* spin for the grate's reply */
-    spins = 0;
-    u64 deadline = local_clock() + THREEI_SPIN_BUDGET;
-    while (smp_load_acquire(&slot->state) != THREEI_SLOT_DONE) {
-        cpu_relax();
-        if (++spins >= THREEI_SPIN_BUDGET) {
-            spins = 0;
-            if (READ_ONCE(ctx->dead)) {
-                threei_slot_reclaim(ring, slot_idx);
-                *out = -ESRCH;
-                return true;
-            }
-            if (fatal_signal_pending(current)) {
-                threei_slot_reclaim(ring, slot_idx);
-                *out = -EINTR;
-                return true;
-            }
-            /* avoid circular wait between the cage and the grate.
-             * the cage waits for the grate to mark its slot DONE,
-             * the grate waits for the cage to complete the inject,
-             * the cage can't complete the inject because it's busy
-             * waiting for the grate */
-            {
-                struct threei_inject *inj =
-                    READ_ONCE(current->threei_inject);
+	/* publish: CLAIMED -> PENDING, then the bit */
+	smp_store_release(&slot->state, THREEI_SLOT_PENDING);
+	smp_mb__before_atomic();
+	set_bit(slot_idx, (unsigned long *)&ring->pending_mask);
 
-                /* the grate has forwarded back to me the very syscall
-                 * I'm currently blocked forwarding */
-                if (inj && READ_ONCE(inj->active) && inj->nr == nr) {
-                    current->threei_inject = NULL;
-                    smp_rmb();
+	/* spin for the grate's reply */
+	spins = 0;
+	u64 deadline = local_clock() + THREEI_SPIN_BUDGET;
+	while (smp_load_acquire(&slot->state) != THREEI_SLOT_DONE) {
+		cpu_relax();
+		if (++spins >= THREEI_SPIN_BUDGET) {
+			spins = 0;
+			if (READ_ONCE(ctx->dead)) {
+				threei_slot_reclaim(ring, slot_idx);
+				*out = -ESRCH;
+				return true;
+			}
+			if (fatal_signal_pending(current)) {
+				threei_slot_reclaim(ring, slot_idx);
+				*out = -EINTR;
+				return true;
+			}
+			/* avoid circular wait between the cage and the grate.
+			* the cage waits for the grate to mark its slot DONE,
+			* the grate waits for the cage to complete the inject,
+			* the cage can't complete the inject because it's busy
+			* waiting for the grate */
+			{
+				struct threei_inject *inj =
+					READ_ONCE(current->threei_inject);
 
-                    /* forwarded args become THIS syscall's args -> regs */
-                    memcpy(args, inj->args, sizeof(inj->args));
+				/* the grate has forwarded back to me the very syscall
+				* I'm currently blocked forwarding */
+				if (inj && READ_ONCE(inj->active) &&
+				    inj->nr == nr) {
+					current->threei_inject = NULL;
+					smp_rmb();
 
-                    inj->ret = 0;
-                    inj->active = false;
-                    complete(inj->done); /* release the grate */
-                    threei_inject_put(inj);
+					/* forwarded args become THIS syscall's args -> regs */
+					memcpy(args, inj->args,
+					       sizeof(inj->args));
 
-                    threei_slot_reclaim(ring, slot_idx);
-                    *out = THREEI_ALLOW; /* native over args[] */
-                    return true;
-                }
-            }
-            if (local_clock() > deadline) {
-                if (threei_slot_reclaim(ring, slot_idx)) {
-                    /* reclaimed: the grate never saw it. safe to resubmit */
-                    return false; /* forward_via_completion */
-                }
-                grate_claimed = true;
-            }
+					inj->ret = 0;
+					inj->active = false;
+					complete(
+						inj->done); /* release the grate */
+					threei_inject_put(inj);
 
-            cond_resched();
-        }
-    }
+					threei_slot_reclaim(ring, slot_idx);
+					*out = THREEI_ALLOW; /* native over args[] */
+					return true;
+				}
+			}
+			if (local_clock() > deadline) {
+				if (threei_slot_reclaim(ring, slot_idx)) {
+					/* reclaimed: the grate never saw it. safe to resubmit */
+					return false; /* forward_via_completion */
+				}
+				grate_claimed = true;
+			}
 
-    /* read the result befor handling the slot back */
-    *out = (long)slot->retval;
-    WRITE_ONCE(slot->state, THREEI_SLOT_FREE);
-    smp_mb__before_atomic();
-    set_bit(slot_idx, (unsigned long *)&ring->free_mask);
-    return true;
+			cond_resched();
+		}
+	}
+
+	/* read the result befor handling the slot back */
+	*out = (long)slot->retval;
+	WRITE_ONCE(slot->state, THREEI_SLOT_FREE);
+	smp_mb__before_atomic();
+	set_bit(slot_idx, (unsigned long *)&ring->free_mask);
+	return true;
 }
 
 /* slow path: completion + waitqueue */
 static long forward_via_completion(struct threei_grate_ctx *ctx,
-                                   struct handler_result *handler, u32 nr,
-                                   pid_t primary_cage,
-                                   unsigned long args[6]) {
-    struct threei_request req;
-    long ret;
+				   struct handler_result *handler, u32 nr,
+				   pid_t primary_cage, unsigned long args[6])
+{
+	struct threei_request req;
+	long ret;
 
-    memset(&req, 0, sizeof(req));
-    req.id = atomic64_inc_return(&ctx->next_id);
-    req.nr = nr;
-    req.handler_addr = handler->handler_addr;
-    req.cage = primary_cage;
-    memcpy(req.args, args, sizeof(req.args));
-    init_completion(&req.done);
-    req.completed = false;
+	memset(&req, 0, sizeof(req));
+	req.id = atomic64_inc_return(&ctx->next_id);
+	req.nr = nr;
+	req.handler_addr = handler->handler_addr;
+	req.cage = primary_cage;
+	memcpy(req.args, args, sizeof(req.args));
+	init_completion(&req.done);
+	req.completed = false;
 
-    spin_lock(&ctx->lock);
-    if (ctx->dead) {
-        spin_unlock(&ctx->lock);
-        return -ESRCH;
-    }
-    list_add_tail(&req.node, &ctx->requests);
-    spin_unlock(&ctx->lock);
-    wake_up_interruptible_sync(&ctx->recv_wq);
+	spin_lock(&ctx->lock);
+	if (ctx->dead) {
+		spin_unlock(&ctx->lock);
+		return -ESRCH;
+	}
+	list_add_tail(&req.node, &ctx->requests);
+	spin_unlock(&ctx->lock);
+	wake_up_interruptible_sync(&ctx->recv_wq);
 
-    ret = wait_for_completion_interruptible(&req.done);
-    if (ret) {
-        spin_lock(&ctx->lock);
-        if (!req.completed) {
-            list_del(&req.node);
-            spin_unlock(&ctx->lock);
-            return -EINTR;
-        }
-        /* grate completed it between our wakeup and the lock */
-        spin_unlock(&ctx->lock);
-    }
-    return req.retval;
+	ret = wait_for_completion_interruptible(&req.done);
+	if (ret) {
+		spin_lock(&ctx->lock);
+		if (!req.completed) {
+			list_del(&req.node);
+			spin_unlock(&ctx->lock);
+			return -EINTR;
+		}
+		/* grate completed it between our wakeup and the lock */
+		spin_unlock(&ctx->lock);
+	}
+	return req.retval;
 }
 
 /* forward to a grate and block until it responds */
-static long forward_to_grate(struct handler_result *handler,
-                             u32 syscall_nr, pid_t primary_cage,
-                             const s32 arg_cage[6],
-                             unsigned long args[6]) {
-    struct threei_ctx_cache *ctx_cache = current->threei_ctx_cache;
-    struct threei_grate_ctx *ctx;
-    long ret;
-    int slot;
+static long forward_to_grate(struct handler_result *handler, u32 syscall_nr,
+			     pid_t primary_cage, const s32 arg_cage[6],
+			     unsigned long args[6])
+{
+	struct threei_ctx_cache *ctx_cache = current->threei_ctx_cache;
+	struct threei_grate_ctx *ctx;
+	long ret;
+	int slot;
 
-    BUILD_BUG_ON(THREEI_CTX_CACHE_MAX < 1 || THREEI_CTX_CACHE_MAX >= BITS_PER_LONG);
+	BUILD_BUG_ON(THREEI_CTX_CACHE_MAX < 1 ||
+		     THREEI_CTX_CACHE_MAX >= BITS_PER_LONG);
 
-    /*fast path: grate is cached and alive */
-    if (likely(ctx_cache)) {
-        slot = threei_cache_find(ctx_cache, handler->grateid);
-        if (likely(slot >= 0)) {
-            ctx = ctx_cache->ctx[slot];
-            if (likely(!READ_ONCE(ctx->dead))) {
-                goto forward;
-            }
-            threei_cache_drop_slot(ctx_cache, slot);
-        }
-    }
+	/*fast path: grate is cached and alive */
+	if (likely(ctx_cache)) {
+		slot = threei_cache_find(ctx_cache, handler->grateid);
+		if (likely(slot >= 0)) {
+			ctx = ctx_cache->ctx[slot];
+			if (likely(!READ_ONCE(ctx->dead))) {
+				goto forward;
+			}
+			threei_cache_drop_slot(ctx_cache, slot);
+		}
+	}
 
-    /* slow path (uses find_task_by_vpid) which performs heavy radix tree lookup */
-    ctx = threei_resolve_ctx(handler->grateid);
-    if (!ctx) {
-        return -ESRCH;
-    }
+	/* slow path (uses find_task_by_vpid) which performs heavy radix tree lookup */
+	ctx = threei_resolve_ctx(handler->grateid);
+	if (!ctx) {
+		return -ESRCH;
+	}
 
-    /* first forward, allocate memory */
-    if (unlikely(!ctx_cache)) {
-        ctx_cache = kzalloc(sizeof(*ctx_cache), GFP_KERNEL);
-        current->threei_ctx_cache = ctx_cache;
-    }
+	/* first forward, allocate memory */
+	if (unlikely(!ctx_cache)) {
+		ctx_cache = kzalloc(sizeof(*ctx_cache), GFP_KERNEL);
+		current->threei_ctx_cache = ctx_cache;
+	}
 
-    if (likely(ctx_cache)) {
-        threei_cache_insert(ctx_cache, handler->grateid, ctx);
-        goto forward;
-    }
+	if (likely(ctx_cache)) {
+		threei_cache_insert(ctx_cache, handler->grateid, ctx);
+		goto forward;
+	}
 
+	/* these forward calls holds the reference to resolved ctx. we drop it here */
 
-    /* these forward calls holds the reference to resolved ctx. we drop it here */
+	/* fast path: shared ring spin */
+	if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
+			     args, &ret)) {
+		threei_ctx_put(ctx);
+		return ret;
+	}
 
-    /* fast path: shared ring spin */
-    if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
-                         args, &ret)) {
-        threei_ctx_put(ctx);
-        return ret;
-    }
-
-    /* slow path: completion + waitqueue */
-    ret = forward_via_completion(ctx, handler, syscall_nr, primary_cage,
-                                 args);
-    threei_ctx_put(ctx);
-    return ret;
+	/* slow path: completion + waitqueue */
+	ret = forward_via_completion(ctx, handler, syscall_nr, primary_cage,
+				     args);
+	threei_ctx_put(ctx);
+	return ret;
 
 forward:
-    if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
-                        args, &ret)) {
-        return ret;
-    }
+	if (forward_via_ring(ctx, handler, syscall_nr, primary_cage, arg_cage,
+			     args, &ret)) {
+		return ret;
+	}
 
-    return forward_via_completion(ctx, handler, syscall_nr, primary_cage,
-                        args);
+	return forward_via_completion(ctx, handler, syscall_nr, primary_cage,
+				      args);
 }
 
 /* FD Translation routine */
 
 /* The shared routing decision, against current's table. */
 static long __route_current(u32 syscall_nr, pid_t primary_cage,
-                            const s32 arg_cage[6], unsigned long args[6]) {
-    struct handler_result handler;
-    struct threei_handler *cage_handler = NULL;
-    struct task_struct *cage_task;
-    const struct threei_fd_desc *desc;
-    int orig_vfd_arg0 = (int)args[0]; /* save before translation */
-    bool have_handler, handled = false;
-    long ret;
+			    const s32 arg_cage[6], unsigned long args[6])
+{
+	struct handler_result handler;
+	struct threei_handler *cage_handler = NULL;
+	struct task_struct *cage_task;
+	const struct threei_fd_desc *desc;
+	int orig_vfd_arg0 = (int)args[0]; /* save before translation */
+	bool have_handler, handled = false;
+	long ret;
 
-    rcu_read_lock();
-    cage_task = find_task_by_vpid(primary_cage);
-    if (cage_task) {
-        get_task_struct(cage_task);
-        cage_handler = rcu_dereference(cage_task->threei_handler);
-        if (cage_handler && !refcount_inc_not_zero(&cage_handler->refs)) {
-            cage_handler = NULL;
-        }
-    }
-    rcu_read_unlock();
+	rcu_read_lock();
+	cage_task = find_task_by_vpid(primary_cage);
+	if (cage_task) {
+		get_task_struct(cage_task);
+		cage_handler = rcu_dereference(cage_task->threei_handler);
+		if (cage_handler &&
+		    !refcount_inc_not_zero(&cage_handler->refs)) {
+			cage_handler = NULL;
+		}
+	}
+	rcu_read_unlock();
 
-    have_handler = (get_handler(syscall_nr, &handler) == 0);
-    desc = threei_get_fd_desc(syscall_nr);
-    /*
-     * Generic isolation-preserving path: descriptor exists, takes an fd,
-     * but the grate registered NO handler for it. Execute against the
-     * grate's file* here. current is the grate on this path (we are acting
-     * on behalf of primary_cage), so pass cage_task. the buffer copies
-     * must target the cage's address space via access_process_vm, not
-     * current's.
-     */
-    if (!have_handler && cage_handler && desc && desc->arg_is_fd) {
-        ret = threei_generic_fd_exec(cage_task, syscall_nr, desc, args,
-                                     &handled);
-        if (handled) {
-            /* postprocess for FREES_FD0 (close): free the vfd slot.
-             * orig_vfd_arg0 holds the pre-translation vfd. */
-            ret = threei_postprocess_fd(cage_task, syscall_nr, 0,
-                                        orig_vfd_arg0, ret);
-            refcount_dec(&cage_handler->refs);
-            put_task_struct(cage_task);
-            return ret;
-        }
-        /* not handled (e.g. native fd, or syscall we don't implement).
-         * fall through to normal translate + forward/native below */
-    }
+	have_handler = (get_handler(syscall_nr, &handler) == 0);
+	desc = threei_get_fd_desc(syscall_nr);
+	/*
+	* Generic isolation-preserving path: descriptor exists, takes an fd,
+	* but the grate registered NO handler for it. Execute against the
+	* grate's file* here. current is the grate on this path (we are acting
+	* on behalf of primary_cage), so pass cage_task. the buffer copies
+	* must target the cage's address space via access_process_vm, not
+	* current's.
+	*/
+	if (!have_handler && cage_handler && desc && desc->arg_is_fd) {
+		ret = threei_generic_fd_exec(cage_task, syscall_nr, desc, args,
+					     &handled);
+		if (handled) {
+			/* postprocess for FREES_FD0 (close): free the vfd slot.
+			* orig_vfd_arg0 holds the pre-translation vfd. */
+			ret = threei_postprocess_fd(cage_task, syscall_nr, 0,
+						    orig_vfd_arg0, ret);
+			refcount_dec(&cage_handler->refs);
+			put_task_struct(cage_task);
+			return ret;
+		}
+		/* not handled (e.g. native fd, or syscall we don't implement).
+		* fall through to normal translate + forward/native below */
+	}
 
-    /*
-     * run the syscall: forward to a further grate if one is registered
-     * against current, else run it natively here. Either way we get a
-     * return value we then postprocess.
-     */
-    have_handler = (get_handler(syscall_nr, &handler) == 0);
-    if (have_handler) {
-        ret = forward_to_grate(&handler, syscall_nr, primary_cage,
-                               arg_cage, args);
-    } else if (primary_cage != 0 &&
-               primary_cage != task_tgid_nr(current) &&
-               threei_is_thread_op(syscall_nr)) {
-        ret = threei_inject_call(primary_cage, syscall_nr, args);
-    } else if (primary_cage != 0 &&
-               primary_cage != task_tgid_nr(current) &&
-               threei_is_mm_op(syscall_nr)) {
-        ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage, args);
-    } else {
-        ret = native_syscall(syscall_nr, args);
-    }
+	/*
+	* run the syscall: forward to a further grate if one is registered
+	* against current, else run it natively here. Either way we get a
+	* return value we then postprocess.
+	*/
+	have_handler = (get_handler(syscall_nr, &handler) == 0);
+	if (have_handler) {
+		ret = forward_to_grate(&handler, syscall_nr, primary_cage,
+				       arg_cage, args);
+	} else if (primary_cage != 0 && primary_cage != task_tgid_nr(current) &&
+		   threei_is_thread_op(syscall_nr)) {
+		ret = threei_inject_call(primary_cage, syscall_nr, args);
+	} else if (primary_cage != 0 && primary_cage != task_tgid_nr(current) &&
+		   threei_is_mm_op(syscall_nr)) {
+		ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage,
+				       args);
+	} else {
+		ret = native_syscall(syscall_nr, args);
+	}
 
-    if (cage_handler) {
-        pid_t grateid =
-            have_handler ? handler.grateid : task_tgid_nr(current);
-        ret = threei_postprocess_fd(cage_task, syscall_nr, grateid,
-                                    orig_vfd_arg0, ret);
-        refcount_dec(&cage_handler->refs);
-    }
-    if (cage_task) {
-        put_task_struct(cage_task);
-    }
-    return ret;
+	if (cage_handler) {
+		pid_t grateid = have_handler ? handler.grateid :
+					       task_tgid_nr(current);
+		ret = threei_postprocess_fd(cage_task, syscall_nr, grateid,
+					    orig_vfd_arg0, ret);
+		refcount_dec(&cage_handler->refs);
+	}
+	if (cage_task) {
+		put_task_struct(cage_task);
+	}
+	return ret;
 }
 
 /*
-static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd) {
-    struct task_struct *grate;
-    struct file *file;
-    int cage_fd;
+static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd)
+{
+	struct task_struct *grate;
+	struct file *file;
+	int cage_fd;
 
-    rcu_read_lock();
-    grate = find_task_by_vpid(grateid);
-    if (grate) {
-        get_task_struct(grate);
-    }
-    rcu_read_unlock();
-    if (!grate) {
-        return -ESRCH;
-    }
+	rcu_read_lock();
+	grate = find_task_by_vpid(grateid);
+	if (grate) {
+		get_task_struct(grate);
+	}
+	rcu_read_unlock();
+	if (!grate) {
+		return -ESRCH;
+	}
 
-    // get struct file* for an fd in a specific task
-    file = fget_task(grate, real_fd);
-    put_task_struct(grate);
-    if (!file) {
-        return -EBADF;
-    }
+	// get struct file* for an fd in a specific task
+	file = fget_task(grate, real_fd);
+	put_task_struct(grate);
+	if (!file) {
+		return -EBADF;
+	}
 
-    cage_fd = get_unused_fd_flags(0);
-    if (cage_fd < 0) {
-        fput(file);
-        return cage_fd;
-    }
-    fd_install(cage_fd, file);
-    return cage_fd;
+	cage_fd = get_unused_fd_flags(0);
+	if (cage_fd < 0) {
+		fput(file);
+		return cage_fd;
+	}
+	fd_install(cage_fd, file);
+	return cage_fd;
 }
 */
 
@@ -706,58 +734,59 @@ static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd) {
  * and performs translation, executing that syscall natively in cage's
  * context.
  */
-bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result) {
-    struct handler_result handler;
-    const struct threei_fd_desc *fdesc;
-    long verdict;
+bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result)
+{
+	struct handler_result handler;
+	const struct threei_fd_desc *fdesc;
+	long verdict;
 
-    if (get_handler(syscall_nr, &handler) == 0) {
-        verdict = forward_to_grate(&handler, syscall_nr,
-                                   task_tgid_nr(current), NULL, args);
-        /* handler exists: forward to the grate (active mediation) */
-        if (verdict == THREEI_ALLOW) {
-            return false;
-        }
-        *result = verdict;
-        return true;
-    }
+	if (get_handler(syscall_nr, &handler) == 0) {
+		verdict = forward_to_grate(&handler, syscall_nr,
+					   task_tgid_nr(current), NULL, args);
+		/* handler exists: forward to the grate (active mediation) */
+		if (verdict == THREEI_ALLOW) {
+			return false;
+		}
+		*result = verdict;
+		return true;
+	}
 
-    fdesc = threei_get_fd_desc(syscall_nr);
-    if (fdesc && (fdesc->flags & THREEI_ARG_IS_FD_MAP)) {
-        threei_gate_map_fd(fdesc, args);
-        return false;
-    }
+	fdesc = threei_get_fd_desc(syscall_nr);
+	if (fdesc && (fdesc->flags & THREEI_ARG_IS_FD_MAP)) {
+		threei_gate_map_fd(fdesc, args);
+		return false;
+	}
 
-    if (fdesc && fdesc->arg_is_fd) {
-        struct threei_handler *ch;
-        bool handled = false;
-        long ret;
+	if (fdesc && fdesc->arg_is_fd) {
+		struct threei_handler *ch;
+		bool handled = false;
+		long ret;
 
-        rcu_read_lock();
-        ch = rcu_dereference(current->threei_handler);
-        if (ch && !refcount_inc_not_zero(&ch->refs)) {
-            ch = NULL;
-        }
-        rcu_read_unlock();
+		rcu_read_lock();
+		ch = rcu_dereference(current->threei_handler);
+		if (ch && !refcount_inc_not_zero(&ch->refs)) {
+			ch = NULL;
+		}
+		rcu_read_unlock();
 
-        if (ch) {
-            int orig_vfd = (int)args[0];
+		if (ch) {
+			int orig_vfd = (int)args[0];
 
-            ret = threei_generic_fd_exec(NULL, syscall_nr, fdesc, args,
-                                         &handled);
+			ret = threei_generic_fd_exec(NULL, syscall_nr, fdesc,
+						     args, &handled);
 
-            if (handled) {
-                /* FREES_FD0 (close): free the vfd slot */
-                ret = threei_postprocess_fd(NULL, syscall_nr, 0, orig_vfd,
-                                            ret);
-                refcount_dec(&ch->refs);
-                *result = ret;
-                return true;
-            }
-            refcount_dec(&ch->refs);
-        }
-    }
-    return false;
+			if (handled) {
+				/* FREES_FD0 (close): free the vfd slot */
+				ret = threei_postprocess_fd(NULL, syscall_nr, 0,
+							    orig_vfd, ret);
+				refcount_dec(&ch->refs);
+				*result = ret;
+				return true;
+			}
+			refcount_dec(&ch->refs);
+		}
+	}
+	return false;
 }
 
 /*
@@ -766,28 +795,29 @@ bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result) {
  * integrated yet).
  */
 static bool threei_verify_forwarder(pid_t cageid, u32 syscall_nr,
-                                    struct task_struct *forwarder) {
-    struct task_struct *cage;
-    struct threei_handler *handler;
-    bool verified = false;
+				    struct task_struct *forwarder)
+{
+	struct task_struct *cage;
+	struct threei_handler *handler;
+	bool verified = false;
 
-    if (syscall_nr >= NR_syscalls) {
-        return false;
-    }
+	if (syscall_nr >= NR_syscalls) {
+		return false;
+	}
 
-    rcu_read_lock();
-    cage = find_task_by_vpid(cageid);
-    if (cage) {
-        handler = rcu_dereference(cage->threei_handler);
-        if (handler && test_bit(syscall_nr, handler->registered) &&
-            handler->table[syscall_nr].grateid ==
-                task_tgid_nr(forwarder)) {
-            verified = true;
-        }
-    }
-    rcu_read_unlock();
+	rcu_read_lock();
+	cage = find_task_by_vpid(cageid);
+	if (cage) {
+		handler = rcu_dereference(cage->threei_handler);
+		if (handler && test_bit(syscall_nr, handler->registered) &&
+		    handler->table[syscall_nr].grateid ==
+			    task_tgid_nr(forwarder)) {
+			verified = true;
+		}
+	}
+	rcu_read_unlock();
 
-    return verified;
+	return verified;
 }
 
 /*
@@ -795,70 +825,72 @@ static bool threei_verify_forwarder(pid_t cageid, u32 syscall_nr,
  * only attribute an argument to a cage it is a registered handler for.
  */
 static bool threei_verify_all_cages(pid_t primary_cage, u32 syscall_nr,
-                                    const s32 arg_cage[6],
-                                    struct task_struct *forwarder) {
-    int i, j;
+				    const s32 arg_cage[6],
+				    struct task_struct *forwarder)
+{
+	int i, j;
 
-    if (!threei_verify_forwarder(primary_cage, syscall_nr, forwarder)) {
-        return false;
-    }
+	if (!threei_verify_forwarder(primary_cage, syscall_nr, forwarder)) {
+		return false;
+	}
 
-    /* all args default to primary_cage i.e already checked */
-    if (!arg_cage) {
-        return true;
-    }
+	/* all args default to primary_cage i.e already checked */
+	if (!arg_cage) {
+		return true;
+	}
 
-    for (i = 0; i < 6; i++) {
-        pid_t cage = arg_cage[i];
+	for (i = 0; i < 6; i++) {
+		pid_t cage = arg_cage[i];
 
-        if (cage == 0 || cage == primary_cage) {
-            continue;
-        }
+		if (cage == 0 || cage == primary_cage) {
+			continue;
+		}
 
-        /* skip verification of duplicate entries */
-        for (j = 0; j < i; j++) {
-            if (arg_cage[j] == cage) {
-                break;
-            }
-        }
-        if (j < i) {
-            continue;
-        }
+		/* skip verification of duplicate entries */
+		for (j = 0; j < i; j++) {
+			if (arg_cage[j] == cage) {
+				break;
+			}
+		}
+		if (j < i) {
+			continue;
+		}
 
-        if (!threei_verify_forwarder(cage, syscall_nr, forwarder)) {
-            return false;
-        }
-    }
-    return true;
+		if (!threei_verify_forwarder(cage, syscall_nr, forwarder)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 /* make_threei_call - syscall */
 SYSCALL_DEFINE4(make_threei_call, u32, syscall_nr, pid_t, primary_cage,
-                const s32 __user *, user_arg_cage,
-                const unsigned long __user *, user_args) {
-    unsigned long args[6];
-    s32 arg_cage[6];
-    s32 *arg_cage_p = NULL;
+		const s32 __user *, user_arg_cage, const unsigned long __user *,
+		user_args)
+{
+	unsigned long args[6];
+	s32 arg_cage[6];
+	s32 *arg_cage_p = NULL;
 
-    if (copy_from_user(args, user_args, sizeof(args))) {
-        return -EFAULT;
-    }
+	if (copy_from_user(args, user_args, sizeof(args))) {
+		return -EFAULT;
+	}
 
-    if (user_arg_cage) {
-        if (copy_from_user(arg_cage, user_arg_cage, sizeof(arg_cage))) {
-            return -EFAULT;
-        }
-        arg_cage_p = arg_cage;
-    }
+	if (user_arg_cage) {
+		if (copy_from_user(arg_cage, user_arg_cage, sizeof(arg_cage))) {
+			return -EFAULT;
+		}
+		arg_cage_p = arg_cage;
+	}
 
-    /* commented out verification routine */
-    /*
-    if (!threei_verify_all_cages(primary_cage, syscall_nr, arg_cage_p,
-                                 current)) {
-        return -EPERM;
-    }
-    */
-    return __route_current(syscall_nr, primary_cage, arg_cage_p, args);
+	/* commented out verification routine */
+	/*
+	if (!threei_verify_all_cages(primary_cage, syscall_nr, arg_cage_p,
+				     current)) {
+		return -EPERM;
+	}
+	*/
+	return __route_current(syscall_nr, primary_cage, arg_cage_p, args);
 }
 
 /*
@@ -867,97 +899,99 @@ SYSCALL_DEFINE4(make_threei_call, u32, syscall_nr, pid_t, primary_cage,
  * be the caller (a handler copies a cage's buffers).
  */
 SYSCALL_DEFINE6(copy_data_between_cages, pid_t, src_cage, unsigned long,
-                src_addr, pid_t, dst_cage, unsigned long, dst_addr, size_t,
-                len, unsigned long, copytype) {
-    struct task_struct *src_task = NULL, *dst_task = NULL;
-    void *buf;
-    long copied, ret = 0;
+		src_addr, pid_t, dst_cage, unsigned long, dst_addr, size_t, len,
+		unsigned long, copytype)
+{
+	struct task_struct *src_task = NULL, *dst_task = NULL;
+	void *buf;
+	long copied, ret = 0;
 
-    if (!len || len > THREEI_MAX_COPY) {
-        return -EINVAL;
-    }
-    if (copytype != THREEI_COPY_MEMCPY &&
-        copytype != THREEI_COPY_STRNCPY) {
-        return -EINVAL;
-    }
+	if (!len || len > THREEI_MAX_COPY) {
+		return -EINVAL;
+	}
+	if (copytype != THREEI_COPY_MEMCPY && copytype != THREEI_COPY_STRNCPY) {
+		return -EINVAL;
+	}
 
-    buf = kvmalloc(len, GFP_KERNEL);
-    if (!buf) {
-        return -ENOMEM;
-    }
+	buf = kvmalloc(len, GFP_KERNEL);
+	if (!buf) {
+		return -ENOMEM;
+	}
 
-    rcu_read_lock();
-    src_task = find_task_by_vpid(src_cage);
-    if (src_task) {
-        get_task_struct(src_task);
-    }
-    dst_task = find_task_by_vpid(dst_cage);
-    if (dst_task) {
-        get_task_struct(dst_task);
-    }
-    rcu_read_unlock();
+	rcu_read_lock();
+	src_task = find_task_by_vpid(src_cage);
+	if (src_task) {
+		get_task_struct(src_task);
+	}
+	dst_task = find_task_by_vpid(dst_cage);
+	if (dst_task) {
+		get_task_struct(dst_task);
+	}
+	rcu_read_unlock();
 
-    if (!src_task || !dst_task) {
-        ret = -ESRCH;
-        goto out;
-    }
+	if (!src_task || !dst_task) {
+		ret = -ESRCH;
+		goto out;
+	}
 
-    if (copytype == THREEI_COPY_MEMCPY) {
-        /* RawMemcpy: exact-length, all-or-nothing (UNCHANGED) */
-        copied = access_process_vm(src_task, src_addr, buf, len, 0);
-        if (copied != (long)len) {
-            ret = -EFAULT;
-            goto out;
-        }
-        copied =
-            access_process_vm(dst_task, dst_addr, buf, len, FOLL_WRITE);
-        if (copied != (long)len) {
-            ret = -EFAULT;
-        }
-    } else {
-        /* Strncpy: NUL-terminated within len, short-read tolerant
-         * access_process_vm returns the bytes actually readable,
-         * which is < len when the source range runs into an unmapped page
-         * (the stack-edge case that made a fixed-len read EFAULT on a
-         * short path). Scan the readable prefix for '\0'; copy strlen+1
-         * (including the terminator). */
-        size_t slen;
+	if (copytype == THREEI_COPY_MEMCPY) {
+		/* RawMemcpy: exact-length, all-or-nothing (UNCHANGED) */
+		copied = access_process_vm(src_task, src_addr, buf, len, 0);
+		if (copied != (long)len) {
+			ret = -EFAULT;
+			goto out;
+		}
+		copied = access_process_vm(dst_task, dst_addr, buf, len,
+					   FOLL_WRITE);
+		if (copied != (long)len) {
+			ret = -EFAULT;
+		}
+	} else {
+		/*
+		* Strncpy: NUL-terminated within len, short-read tolerant
+		* access_process_vm returns the bytes actually readable,
+		* which is < len when the source range runs into an unmapped page
+		* (the stack-edge case that made a fixed-len read EFAULT on a
+		* short path). Scan the readable prefix for '\0'; copy strlen+1
+		* (including the terminator).
+		*/
+		size_t slen;
 
-        copied = access_process_vm(src_task, src_addr, buf, len, 0);
-        if (copied <= 0) {
-            ret = -EFAULT; /* not even the first byte readable */
-            goto out;
-        }
+		copied = access_process_vm(src_task, src_addr, buf, len, 0);
+		if (copied <= 0) {
+			ret = -EFAULT; /* not even the first byte readable */
+			goto out;
+		}
 
-        slen = strnlen(buf, copied);
-        if (slen == (size_t)copied) {
-            /* no '\0' within the readable prefix / within len: like lind's
-             * "null terminator not found within max length" */
-            ret = -ENAMETOOLONG;
-            goto out;
-        }
+		slen = strnlen(buf, copied);
+		if (slen == (size_t)copied) {
+			/* no '\0' within the readable prefix / within len: like lind's
+			* "null terminator not found within max length" */
+			ret = -ENAMETOOLONG;
+			goto out;
+		}
 
-        slen += 1; /* include '\0' (lind: n + 1) */
+		slen += 1; /* include '\0' (lind: n + 1) */
 
-        copied =
-            access_process_vm(dst_task, dst_addr, buf, slen, FOLL_WRITE);
-        if (copied != (long)slen) {
-            ret = -EFAULT;
-            goto out;
-        }
+		copied = access_process_vm(dst_task, dst_addr, buf, slen,
+					   FOLL_WRITE);
+		if (copied != (long)slen) {
+			ret = -EFAULT;
+			goto out;
+		}
 
-        ret = (long)slen; /* bytes copied, including '\0' */
-    }
+		ret = (long)slen; /* bytes copied, including '\0' */
+	}
 
 out:
-    if (src_task) {
-        put_task_struct(src_task);
-    }
-    if (dst_task) {
-        put_task_struct(dst_task);
-    }
-    kvfree(buf);
-    return ret;
+	if (src_task) {
+		put_task_struct(src_task);
+	}
+	if (dst_task) {
+		put_task_struct(dst_task);
+	}
+	kvfree(buf);
+	return ret;
 }
 
 /*
@@ -967,54 +1001,55 @@ out:
  * land in the right mm. Returns the userspace address, or 0 on failure.
  * Idempotent: a second call returns the already-mapped address.
  */
-static unsigned long threei_create_ring(struct threei_grate_ctx *ctx) {
-    unsigned long uaddr;
-    struct vm_area_struct *vma;
-    int ret;
+static unsigned long threei_create_ring(struct threei_grate_ctx *ctx)
+{
+	unsigned long uaddr;
+	struct vm_area_struct *vma;
+	int ret;
 
-    if (ctx->ring_uaddr) {
-        return ctx->ring_uaddr;
-    }
+	if (ctx->ring_uaddr) {
+		return ctx->ring_uaddr;
+	}
 
-    if (!ctx->ring) {
-        if (threei_ring_alloc(ctx)) {
-            return 0;
-        }
-    }
+	if (!ctx->ring) {
+		if (threei_ring_alloc(ctx)) {
+			return 0;
+		}
+	}
 
-    uaddr = vm_mmap(NULL, 0, PAGE_ALIGN(sizeof(struct threei_ring)),
-                    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0);
-    if (IS_ERR_VALUE(uaddr)) {
-        return 0;
-    }
+	uaddr = vm_mmap(NULL, 0, PAGE_ALIGN(sizeof(struct threei_ring)),
+			PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, 0);
+	if (IS_ERR_VALUE(uaddr)) {
+		return 0;
+	}
 
-    if (mmap_write_lock_killable(current->mm)) {
-        vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
-        return 0;
-    }
+	if (mmap_write_lock_killable(current->mm)) {
+		vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
+		return 0;
+	}
 
-    vma = find_vma(current->mm, uaddr);
-    if (!vma) {
-        mmap_write_unlock(current->mm);
-        vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
-        return 0;
-    }
+	vma = find_vma(current->mm, uaddr);
+	if (!vma) {
+		mmap_write_unlock(current->mm);
+		vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
+		return 0;
+	}
 
-    /* prevent the anonymous mapping from being merged/swapped under us */
-    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	/* prevent the anonymous mapping from being merged/swapped under us */
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
-    ret = remap_pfn_range(
-        vma, uaddr, virt_to_phys(ctx->ring) >> PAGE_SHIFT,
-        PAGE_ALIGN(sizeof(struct threei_ring)), vma->vm_page_prot);
-    mmap_write_unlock(current->mm);
+	ret = remap_pfn_range(vma, uaddr, virt_to_phys(ctx->ring) >> PAGE_SHIFT,
+			      PAGE_ALIGN(sizeof(struct threei_ring)),
+			      vma->vm_page_prot);
+	mmap_write_unlock(current->mm);
 
-    if (ret) {
-        vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
-        return 0;
-    }
+	if (ret) {
+		vm_munmap(uaddr, PAGE_ALIGN(sizeof(struct threei_ring)));
+		return 0;
+	}
 
-    ctx->ring_uaddr = uaddr;
-    return uaddr;
+	ctx->ring_uaddr = uaddr;
+	return uaddr;
 }
 
 /*
@@ -1026,242 +1061,253 @@ static unsigned long threei_create_ring(struct threei_grate_ctx *ctx) {
  *
  * A second call returns the already-mapped address.
  */
-SYSCALL_DEFINE0(threei_grate_setup) {
-    struct threei_grate_ctx *ctx;
-    unsigned long uaddr;
+SYSCALL_DEFINE0(threei_grate_setup)
+{
+	struct threei_grate_ctx *ctx;
+	unsigned long uaddr;
 
-    ctx = grate_ctx_get(current->group_leader);
-    if (!ctx) {
-        return -ENOMEM;
-    }
+	ctx = grate_ctx_get(current->group_leader);
+	if (!ctx) {
+		return -ENOMEM;
+	}
 
-    uaddr = threei_create_ring(ctx);
-    if (!uaddr) {
-        return -ENOMEM;
-    }
+	uaddr = threei_create_ring(ctx);
+	if (!uaddr) {
+		return -ENOMEM;
+	}
 
-    return (long)uaddr;
+	return (long)uaddr;
 }
 
 SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
-                unsigned int, size) {
-    struct threei_grate_ctx *ctx;
-    struct threei_request *req;
-    struct threei_req_user out;
-    unsigned long ring_uaddr;
+		unsigned int, size)
+{
+	struct threei_grate_ctx *ctx;
+	struct threei_request *req;
+	struct threei_req_user out;
+	unsigned long ring_uaddr;
 
-    /*
-     * The grate may not have been targeted yet; create its ctx so it can
-     * block waiting rather than failing.
-     */
-    ctx = grate_ctx_get(current->group_leader);
-    if (!ctx) {
-        return -ENOMEM;
-    }
+	/*
+	* The grate may not have been targeted yet; create its ctx so it can
+	* block waiting rather than failing.
+	*/
+	ctx = grate_ctx_get(current->group_leader);
+	if (!ctx) {
+		return -ENOMEM;
+	}
 
-    /* establish the ring on first recv (no-op afterwards) */
-    ring_uaddr = threei_create_ring(ctx);
+	/* establish the ring on first recv (no-op afterwards) */
+	ring_uaddr = threei_create_ring(ctx);
 
-    if (current->policy != SCHED_RR) {
-	threei_promote_grate(current);
-    }
+	if (current->policy != SCHED_RR) {
+		threei_promote_grate(current);
+	}
 
-    if (wait_event_interruptible(ctx->recv_wq,
-                                 has_pending(ctx) || ctx->dead)) {
-        return -EINTR;
-    }
+	if (wait_event_interruptible(ctx->recv_wq,
+				     has_pending(ctx) || ctx->dead)) {
+		return -EINTR;
+	}
 
-    if (ctx->dead && !has_pending(ctx)) {
-        /*signal grate to exit*/
-        return -ENODEV;
-    }
+	if (ctx->dead && !has_pending(ctx)) {
+		/*signal grate to exit*/
+		return -ENODEV;
+	}
 
-    spin_lock(&ctx->lock);
-    req = list_first_entry_or_null(&ctx->requests, struct threei_request,
-                                   node);
-    if (req) {
-        list_move_tail(&req->node, &ctx->inflight);
-    }
-    spin_unlock(&ctx->lock);
-    if (!req) {
-        return -EAGAIN;
-    }
+	spin_lock(&ctx->lock);
+	req = list_first_entry_or_null(&ctx->requests, struct threei_request,
+				       node);
+	if (req) {
+		list_move_tail(&req->node, &ctx->inflight);
+	}
+	spin_unlock(&ctx->lock);
+	if (!req) {
+		return -EAGAIN;
+	}
 
-    memset(&out, 0, sizeof(out));
-    out.id = req->id;
-    out.nr = req->nr;
-    out.handler_addr = (unsigned long)req->handler_addr;
-    out.cage = req->cage;
-    memcpy(out.args, req->args, sizeof(out.args));
+	memset(&out, 0, sizeof(out));
+	out.id = req->id;
+	out.nr = req->nr;
+	out.handler_addr = (unsigned long)req->handler_addr;
+	out.cage = req->cage;
+	memcpy(out.args, req->args, sizeof(out.args));
 
-    if (copy_to_user(ureq, &out, min_t(unsigned int, size, sizeof(out)))) {
-        return -EFAULT;
-    }
-    return 0;
+	if (copy_to_user(ureq, &out, min_t(unsigned int, size, sizeof(out)))) {
+		return -EFAULT;
+	}
+	return 0;
 }
 
-SYSCALL_DEFINE2(threei_respond, u64, id, long, retval) {
-    struct threei_grate_ctx *ctx;
-    struct threei_request *req;
+SYSCALL_DEFINE2(threei_respond, u64, id, long, retval)
+{
+	struct threei_grate_ctx *ctx;
+	struct threei_request *req;
 
-    rcu_read_lock();
-    ctx = rcu_dereference(current->group_leader->threei_grate_ctx);
-    rcu_read_unlock();
-    if (!ctx) {
-        return -EINVAL;
-    }
+	rcu_read_lock();
+	ctx = rcu_dereference(current->group_leader->threei_grate_ctx);
+	rcu_read_unlock();
+	if (!ctx) {
+		return -EINVAL;
+	}
 
-    spin_lock(&ctx->lock);
-    req = find_inflight(ctx, id);
-    if (req) {
-        list_del(&req->node);
-        req->retval = retval;
-        req->completed = true;
-        /* wakes the blocked cage */
-        complete(&req->done);
-    }
-    spin_unlock(&ctx->lock);
+	spin_lock(&ctx->lock);
+	req = find_inflight(ctx, id);
+	if (req) {
+		list_del(&req->node);
+		req->retval = retval;
+		req->completed = true;
+		/* wakes the blocked cage */
+		complete(&req->done);
+	}
+	spin_unlock(&ctx->lock);
 
-    return req ? 0 : -ENOENT;
+	return req ? 0 : -ENOENT;
 }
 
 /* LIFECYCLE HOOKS */
 
 /* copy_threei - fork inheritance */
-int copy_threei(struct task_struct *p) {
-    struct threei_handler *handler;
-    struct threei_fdtable *parent_tbl;
+int copy_threei(struct task_struct *p)
+{
+	struct threei_handler *handler;
+	struct threei_fdtable *parent_tbl;
 
-    /* a fork must never inherit a pending injection */
-    p->threei_inject = NULL;
-    /*
-     * A grate receive context is per-task and must NOT be inherited: the
-     * child is a different task with its own (initially absent) context.
-     *
-     * similar is the case with threei_fdtable and  */
-    p->threei_grate_ctx = NULL;
-    p->threei_fdtable = NULL;
-    p->threei_ctx_cache = NULL;
+	/* a fork must never inherit a pending injection */
+	p->threei_inject = NULL;
+	/*
+	* A grate receive context is per-task and must NOT be inherited: the
+	* child is a different task with its own (initially absent) context.
+	*
+	* similar is the case with threei_fdtable and  */
+	p->threei_grate_ctx = NULL;
+	p->threei_fdtable = NULL;
+	p->threei_ctx_cache = NULL;
 
-    rcu_read_lock();
-    handler = rcu_dereference(current->threei_handler);
+	rcu_read_lock();
+	handler = rcu_dereference(current->threei_handler);
 
-    /*
-     * refcount_inc_not_zero guards against the object being torn down
-     * concurrently (a sharing thread, or a grate dropping the cage's
-     * table).
-     */
-    if (handler && !refcount_inc_not_zero(&handler->refs)) {
-        handler = NULL;
-    }
-    rcu_read_unlock();
+	/*
+	* refcount_inc_not_zero guards against the object being torn down
+	* concurrently (a sharing thread, or a grate dropping the cage's
+	* table).
+	*/
+	if (handler && !refcount_inc_not_zero(&handler->refs)) {
+		handler = NULL;
+	}
+	rcu_read_unlock();
 
-    /* p is not yet visible to other CPUs: a plain store is sufficient. */
-    p->threei_handler = handler;
+	/* p is not yet visible to other CPUs: a plain store is sufficient. */
+	p->threei_handler = handler;
 
-    if (handler && !bitmap_empty(handler->registered, NR_syscalls)) {
-        set_task_syscall_work(p, THREEI);
-    } else {
-        clear_task_syscall_work(p, THREEI);
-    }
+	if (handler && !bitmap_empty(handler->registered, NR_syscalls)) {
+		set_task_syscall_work(p, THREEI);
+	} else {
+		clear_task_syscall_work(p, THREEI);
+	}
 
-    /* clone the parent cage's vfd table (real fork() duplicates the
-     * descriptor table; sharing it would let the child's close() free
-     * parent's descriptors */
-    parent_tbl = threei_fdtable_lookup_get(current);
-    if (parent_tbl) {
-        p->threei_fdtable = threei_fdtable_clone(parent_tbl);
-        threei_fdtable_put(parent_tbl);
-    }
+	/*
+	* clone the parent cage's vfd table (real fork() duplicates the
+	* descriptor table; sharing it would let the child's close() free
+	* parent's descriptors
+	*/
+	parent_tbl = threei_fdtable_lookup_get(current);
+	if (parent_tbl) {
+		p->threei_fdtable = threei_fdtable_clone(parent_tbl);
+		threei_fdtable_put(parent_tbl);
+	}
 
-    return 0;
+	return 0;
 }
 
 /* threei_exit - exit teardown */
-void threei_exit(struct task_struct *task) {
-    struct threei_grate_ctx *ctx;
-    struct threei_handler *handler;
-    struct task_struct *grate;
-    struct threei_inject *inj;
-    struct threei_fdtable *fdtable;
+void threei_exit(struct task_struct *task)
+{
+	struct threei_grate_ctx *ctx;
+	struct threei_handler *handler;
+	struct task_struct *grate;
+	struct threei_inject *inj;
+	struct threei_fdtable *fdtable;
 
-    /* If this task dies with an injected syscall still pending, unblock
-     * the arming grate (waiting in threei_inject_call) so it doesn't hang. */
-    inj = task->threei_inject;
-    if (inj) {
-        task->threei_inject = NULL;
-        if (READ_ONCE(inj->active)) {
-            inj->ret = -ESRCH;
-            inj->active = false;
-            complete(inj->done);
-        }
-        threei_inject_put(inj);
-    }
+	/*
+	* If this task dies with an injected syscall still pending, unblock
+	* the arming grate (waiting in threei_inject_call) so it doesn't hang.
+	*/
+	inj = task->threei_inject;
+	if (inj) {
+		task->threei_inject = NULL;
+		if (READ_ONCE(inj->active)) {
+			inj->ret = -ESRCH;
+			inj->active = false;
+			complete(inj->done);
+		}
+		threei_inject_put(inj);
+	}
 
-    task->threei_inject = NULL;
+	task->threei_inject = NULL;
 
-    /* free  for the cage */
-    threei_cache_free(task);
+	/* free  for the cage */
+	threei_cache_free(task);
 
-    /* before dropping the table, find any registered grate and wake it */
-    rcu_read_lock();
-    handler = rcu_dereference(task->threei_handler);
-    if (handler) {
-        unsigned int nr;
+	/* before dropping the table, find any registered grate and wake it */
+	rcu_read_lock();
+	handler = rcu_dereference(task->threei_handler);
+	if (handler) {
+		unsigned int nr;
 
-        for_each_set_bit(nr, handler->registered, NR_syscalls) {
-            grate = find_task_by_vpid(handler->table[nr].grateid);
-            if (grate) {
-                ctx = rcu_dereference(grate->threei_grate_ctx);
-                if (ctx) {
-                    wake_up(&ctx->recv_wq);
-                }
-            }
-            /*one wake is enough*/
-            break;
-        }
-    }
-    rcu_read_unlock();
+		for_each_set_bit(nr, handler->registered, NR_syscalls) {
+			grate = find_task_by_vpid(handler->table[nr].grateid);
+			if (grate) {
+				ctx = rcu_dereference(grate->threei_grate_ctx);
+				if (ctx) {
+					wake_up(&ctx->recv_wq);
+				}
+			}
+			/*one wake is enough*/
+			break;
+		}
+	}
+	rcu_read_unlock();
 
-    /* 1. Drop this task's interposition table (task-direct, no lookup). */
-    __drop_handlers(task);
+	/* 1. Drop this task's interposition table (task-direct, no lookup). */
+	__drop_handlers(task);
 
-    /* 2. Tear down its grate receive context, if it had one. */
-    if (task == task->group_leader) {
-        task_lock(task);
-        ctx = rcu_dereference_protected(task->threei_grate_ctx,
-                                        lockdep_is_held(&task->alloc_lock));
-        rcu_assign_pointer(task->threei_grate_ctx, NULL);
-        fdtable = rcu_dereference_protected(
-        task->threei_fdtable, lockdep_is_held(&task->alloc_lock));
-        rcu_assign_pointer(task->threei_fdtable, NULL);
-        task_unlock(task);
-        threei_fdtable_put(fdtable);
-    }
+	/* 2. Tear down its grate receive context, if it had one. */
+	if (task == task->group_leader) {
+		task_lock(task);
+		ctx = rcu_dereference_protected(
+			task->threei_grate_ctx,
+			lockdep_is_held(&task->alloc_lock));
+		rcu_assign_pointer(task->threei_grate_ctx, NULL);
+		fdtable = rcu_dereference_protected(
+			task->threei_fdtable,
+			lockdep_is_held(&task->alloc_lock));
+		rcu_assign_pointer(task->threei_fdtable, NULL);
+		task_unlock(task);
+		threei_fdtable_put(fdtable);
+	}
 
-    if (ctx) {
-        struct threei_request *req, *tmp;
+	if (ctx) {
+		struct threei_request *req, *tmp;
 
-        spin_lock(&ctx->lock);
-        ctx->dead = true;
-        /*
-         * Fail every request still pending or in flight: the grate is
-         * gone and will never respond, so unblock the waiting cages.
-         */
-        list_for_each_entry_safe(req, tmp, &ctx->requests, node) {
-            list_del(&req->node);
-            req->retval = -ESRCH;
-            req->completed = true;
-            complete(&req->done);
-        }
-        list_for_each_entry_safe(req, tmp, &ctx->inflight, node) {
-            list_del(&req->node);
-            req->retval = -ESRCH;
-            req->completed = true;
-            complete(&req->done);
-        }
-        spin_unlock(&ctx->lock);
+		spin_lock(&ctx->lock);
+		ctx->dead = true;
+		/*
+		* Fail every request still pending or in flight: the grate is
+		* gone and will never respond, so unblock the waiting cages.
+		*/
+		list_for_each_entry_safe(req, tmp, &ctx->requests, node) {
+			list_del(&req->node);
+			req->retval = -ESRCH;
+			req->completed = true;
+			complete(&req->done);
+		}
+		list_for_each_entry_safe(req, tmp, &ctx->inflight, node) {
+			list_del(&req->node);
+			req->retval = -ESRCH;
+			req->completed = true;
+			complete(&req->done);
+		}
+		spin_unlock(&ctx->lock);
 
-        threei_ctx_put(ctx);
-    }
+		threei_ctx_put(ctx);
+	}
 }
