@@ -109,6 +109,14 @@ extern int mmap_rnd_compat_bits __read_mostly;
 
 #define INVALID_PHYS_ADDR (~(phys_addr_t)0)
 
+#ifdef CONFIG_THREEI
+	int do_mprotect_pkey(unsigned long start,
+		size_t len, unsigned long prot, int pkey);
+
+	unsigned long threei_mremap(unsigned long addr, unsigned long old_len,
+		unsigned long new_len, unsigned long flags, unsigned long new_addr);
+#endif
+
 #include <asm/page.h>
 #include <asm/processor.h>
 

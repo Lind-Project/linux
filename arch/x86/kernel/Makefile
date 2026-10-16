@@ -170,6 +170,8 @@ obj-$(CONFIG_X86_CET)			+= cet.o
 
 obj-$(CONFIG_X86_USER_SHADOW_STACK)	+= shstk.o
 
+obj-$(CONFIG_THREEI)			+= threei_native.o
+
 ###
 # 64 bit specific files
 ifeq ($(CONFIG_X86_64),y)

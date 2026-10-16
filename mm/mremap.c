@@ -2014,6 +2014,37 @@ out:
 }
 
 /*
+ * mremap for callers outside mm/ (3i cross-cage mm ops). Operates on
+ * current->mm, so callers that want target task's mm must have installed
+ * it. Mirrors the mremap syscall.
+ */
+#ifdef CONFIG_THREEI
+unsigned long threei_mremap(unsigned long addr, unsigned long old_len,
+			    unsigned long new_len, unsigned long flags,
+			    unsigned long new_addr)
+{
+	/* copy the body of SYSCALL_DEFINE5(mremap) */
+	struct vm_userfaultfd_ctx uf = NULL_VM_UFFD_CTX;
+	LIST_HEAD(uf_unmap_early);
+	LIST_HEAD(uf_unmap);
+	struct vma_remap_struct vrm = {
+		.addr		= untagged_addr(addr),
+		.old_len	= old_len,
+		.new_len	= new_len,
+		.flags		= flags,
+		.new_addr	= new_addr,
+		.uf		= &uf,
+		.uf_unmap_early	= &uf_unmap_early,
+		.uf_unmap	= &uf_unmap,
+		.remap_type	= MREMAP_INVALID,
+	};
+
+	return do_mremap(&vrm);
+}
+EXPORT_SYMBOL_GPL(threei_mremap);
+#endif
+
+/*
  * Expand (or shrink) an existing mapping, potentially moving it at the
  * same time (controlled by the MREMAP_MAYMOVE flag and available VM space)
  *

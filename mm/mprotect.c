@@ -833,7 +833,7 @@ fail:
 /*
  * pkey==-1 when doing a legacy mprotect()
  */
-static int do_mprotect_pkey(unsigned long start, size_t len,
+int do_mprotect_pkey(unsigned long start, size_t len,
 		unsigned long prot, int pkey)
 {
 	unsigned long nstart, end, tmp, reqprot;
@@ -981,6 +981,7 @@ out:
 	mmap_write_unlock(current->mm);
 	return error;
 }
+EXPORT_SYMBOL_GPL(do_mprotect_pkey);
 
 SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 		unsigned long, prot)

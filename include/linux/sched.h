@@ -50,6 +50,7 @@
 #include <linux/unwind_deferred_types.h>
 #include <asm/kmap_size.h>
 #include <linux/time64.h>
+
 #ifndef COMPILE_OFFSETS
 #include <generated/rq-offsets.h>
 #endif
@@ -1614,6 +1615,15 @@ struct task_struct {
 #ifdef CONFIG_RETHOOK
 	struct llist_head               rethooks;
 #endif
+
+#if IS_ENABLED(CONFIG_THREEI)
+    struct threei_handler	__rcu   *threei_handler;
+    struct threei_grate_ctx	__rcu	*threei_grate_ctx;
+    struct threei_inject		*threei_inject;
+    struct threei_fdtable	__rcu	*threei_fdtable;
+    struct threei_ctx_cache		*threei_ctx_cache;
+#endif
+
 
 #ifdef CONFIG_ARCH_HAS_PARANOID_L1D_FLUSH
 	/*
