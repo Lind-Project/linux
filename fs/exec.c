@@ -68,6 +68,7 @@
 #include <linux/user_events.h>
 #include <linux/rseq.h>
 #include <linux/ksm.h>
+#include <linux/threei.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1150,6 +1151,9 @@ int begin_new_exec(struct linux_binprm * bprm)
 		goto out;
 
 	bprm->mm = NULL;
+#ifdef CONFIG_THREEI
+	threei_exec_commit_notify();
+#endif
 
 	retval = exec_task_namespaces();
 	if (retval)

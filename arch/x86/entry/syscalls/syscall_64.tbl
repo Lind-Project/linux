@@ -402,6 +402,7 @@
 475	common	threei_recv		sys_threei_recv
 476	common	threei_respond		sys_threei_respond
 477 common  threei_grate_setup  sys_threei_grate_setup
+478 common  threei_arena_setup  sys_threei_arena_setup
 
 #
 # Due to a historical design error, certain syscalls are numbered differently

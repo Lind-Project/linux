@@ -14,14 +14,32 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef THREEI_COPY_MEMCPY
+#define THREEI_COPY_MEMCPY  0   /* exact `len` bytes */
+#endif
+#ifndef THREEI_COPY_STRNCPY
+#define THREEI_COPY_STRNCPY 1   /* NUL-terminated, bounded by len */
+#endif
+
 typedef long (*threei_handler_fn)(pid_t cageid, const int arg_cage[6],
                                   unsigned long args[6]);
 
 static inline long make_threei_call(__u32 nr, pid_t primary_cage,
                                     const int arg_cage[6],
                                     unsigned long args[6]) {
-    return syscall(__NR_make_threei_call, nr, primary_cage, arg_cage,
-                   args);
+    long ret;
+    register long r10 __asm__("r10") = (long)args;   /* 4th arg: user_args */
+    __asm__ volatile (
+        "syscall"
+        : "=a"(ret)
+        : "a"((long)__NR_make_threei_call),
+          "D"((long)nr),              /* rdi = syscall_nr   */
+          "S"((long)primary_cage),    /* rsi = primary_cage */
+          "d"((long)arg_cage),        /* rdx = user_arg_cage*/
+          "r"(r10)
+        : "rcx", "r11", "memory"
+    );
+    return ret;
 }
 
 static inline long
@@ -46,6 +64,11 @@ static inline struct threei_ring *threei_grate_setup(void) {
     return (r < 0) ? NULL : (struct threei_ring *)(unsigned long)r;
 }
 
+static inline unsigned long threei_arena_setup(pid_t cageid) {
+    long r = syscall(__NR_threei_arena_setup, cageid);
+    return (r < 0) ? 0 : (unsigned long)r;
+}
+
 /* dispatch helpers */
 static inline long __threei_dispatch(struct threei_req_user *req) {
     threei_handler_fn fn =
@@ -55,18 +78,6 @@ static inline long __threei_dispatch(struct threei_req_user *req) {
 }
 
 static inline void __threei_handle_slot(struct threei_ring_slot *slot) {
-    /*
-    unsigned long a[6];
-    int j;
-
-    for (j = 0; j < 6; j++) {
-        if (slot->arg_is_ptr & (1ULL << j)) {
-            a[j] = (unsigned long)(slot->data + slot->args[j]);
-        } else {
-            a[j] = slot->args[j];
-        }
-    }
-    */
     threei_handler_fn fn =
         (threei_handler_fn)(unsigned long)slot->handler_addr;
     atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_CLAIMED,

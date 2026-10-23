@@ -145,36 +145,6 @@ struct threei_grate_ctx {
     struct rcu_head rcu;
 };
 
-/* marshaling descriptor table */
-/* Only syscalls listed here get their pointer arguments copied into the
- * slot's inline data[] buffer so the grate can dereference them directly.
- * Anything not listed is treated as all-scalar (no marshaling), which is
- */
-
-/*
-enum { ARG_SCALAR = 0, ARG_IN_PTR = 1 };
-
-struct threei_arg_desc {
-    u8  type;
-    u32 size;   // 0 => null-terminated string (strncpy_from_user)
-};
-
-struct threei_syscall_desc {
-    struct threei_arg_desc args[6];
-};
-
-const struct threei_syscall_desc threei_descs[] = {
-#ifdef __NR_openat
-        [__NR_openat] = { .args = {
-                { ARG_SCALAR }, { ARG_IN_PTR, 0 }, { ARG_SCALAR }, {
-ARG_SCALAR }, } }, #endif #ifdef __NR_open
-        [__NR_open] = { .args = {
-                { ARG_IN_PTR, 0 }, { ARG_SCALAR }, { ARG_SCALAR },
-        } },
-#endif
-};
-*/
-
 /* execve specific args */
 struct threei_exec_args {
     char path[NAME_MAX];
@@ -193,9 +163,27 @@ struct threei_inject {
     unsigned long args[6];
     long ret;
     bool active;
+    atomic_t completed;
     refcount_t refs;
     struct completion *done;
-    struct threei_exec_args *exec_args;
+};
+
+/*
+ * Transient full-context borrow taken by a grate thread running a
+ * forwarded syscall as the cage (ctx.c). A non-NULL cage_* is the record
+ * that a ref is held and must be restored + dropped.
+ */
+struct threei_ctx_borrow;
+
+/*
+ * Reserved-but-lazily-backed scratch region in a cage's address space,
+ * used by a grate to stage foreign pointer args (arena.c). The kernel only
+ * reserves + reports the base; the grate moves bytes via
+ * copy_data_between_cages.
+ */
+struct threei_arena {
+	unsigned long base;
+	size_t size;
 };
 
 void put_handler_result(struct handler_result *res);
@@ -213,41 +201,32 @@ bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result);
 int copy_threei(struct task_struct *p);
 void threei_exit(struct task_struct *task);
 
+long threei_forward_dispatch(pid_t cage, u32 syscall_nr, const s32 arg_cage[6],
+                             unsigned long args[6]);
+long threei_run_in_cage_ctx(pid_t target_cage, u32 syscall_nr,
+                            unsigned long args[6]);
+void threei_ctx_restore_emergency(struct task_struct *grate);
+
 extern long native_syscall(u32 nr, unsigned long args[6]);
-
-struct threei_fdtable *threei_fdtable_get_or_create(struct task_struct *cage);
-struct threei_fdtable *threei_fdtable_lookup_get(struct task_struct *cage);
-struct threei_fdtable *threei_fdtable_clone(struct threei_fdtable *src);
-void threei_fdtable_put(struct threei_fdtable *fdtable);
-
-int threei_vfd_alloc(struct threei_fdtable *table, struct file *file,
-                     pid_t owner_grate);
-struct file *threei_vfd_lookup(struct threei_fdtable *table, int vfd);
-void threei_vfd_free(struct threei_fdtable *table, int vfd);
-void threei_fdtable_teardown(struct threei_fdtable *table);
-long threei_generic_fd_exec(struct task_struct *cage_task,
-                            u32 syscall_nr,
-                            const struct threei_fd_desc *desc,
-                            unsigned long args[6], bool *handled);
-int threei_vfd_install_at(struct threei_fdtable *table, int newfd,
-                          struct file *file, pid_t owner_grate);
-inline const struct threei_fd_desc *threei_get_fd_desc(u32 nr);
-long threei_postprocess_fd(struct task_struct *cage_task,
-                                  u32 syscall_nr, pid_t grateid,
-                                  int orig_vfd_arg0, long verdict);
-void threei_gate_map_fd(const struct threei_fd_desc *desc,
-                               unsigned long args[6]);
-void threei_vfd_install_stdio(struct threei_fdtable *table);
-
-	bool threei_is_mm_op(u32 nr);
-long threei_run_mm_op(u32 nr, pid_t target_cage, const s32 arg_cage[6],
-                      unsigned long args[6]);
 
 bool threei_is_thread_op(u32 syscall_nr);
 void threei_inject_put(struct threei_inject *inj);
 long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6]);
 
 void threei_notify_resume(struct pt_regs *regs);
+
+bool threei_is_thread_op(u32 syscall_nr);
+void threei_inject_put(struct threei_inject *inj);
+long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6]);
+void threei_run_injected(struct threei_inject *inj);
+void threei_notify_resume(struct pt_regs *regs);
+bool threei_drain_injection(unsigned long self_nr, unsigned long args[6],
+                            bool *run_native);
+
+void threei_exec_commit_notify(void);
+
+unsigned long threei_arena_get(struct task_struct *cage);
+void threei_arena_free(struct task_struct *task);
 
 int  threei_promote_grate(struct task_struct *grate);
 void threei_set_cage_sched(struct task_struct *cage);
