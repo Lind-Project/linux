@@ -102,6 +102,7 @@
 #include <linux/socket.h>
 #include <linux/splice.h>
 #include <linux/string.h>
+#include <linux/threei.h>
 #include <linux/uaccess.h>
 #include <net/af_unix.h>
 #include <net/net_namespace.h>
@@ -746,7 +747,11 @@ static inline int prepare_peercred(struct unix_peercred *peercred)
 	struct pid *pid;
 	int err;
 
-	pid = task_tgid(current);
+#ifdef CONFIG_THREEI
+	pid = get_pid(task_tgid(threei_identity_task()));
+#else
+	pid = get_pid(task_tgid(current));
+#endif
 	err = pidfs_register_pid(pid);
 	if (likely(!err)) {
 		peercred->peer_pid = get_pid(pid);

@@ -76,13 +76,16 @@ void threei_run_injected(struct threei_inject *inj)
 
 void threei_notify_resume(struct pt_regs *regs)
 {
-	struct threei_inject *inj = current->threei_inject;
+	struct threei_inject *inj = current->threei_inject;;
+
+	clear_thread_flag(TIF_NOTIFY_THREEI);
 
 	if (!inj || !inj->active) {
 		return;
 	}
 
 	current->threei_inject = NULL;
+
 	smp_rmb();
 
 	if (!READ_ONCE(inj->active)) {

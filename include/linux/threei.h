@@ -28,6 +28,10 @@
 
 #define THREEI_GENERIC_MAX_BUF (1UL << 20) /* 1 MiB cap per call */
 
+/* sentinel for task->threei_fwd_req, telling threei_inject_call where the
+ * target cage is so it can nudge it without a signal */
+#define THREEI_FWD_SPIN		((struct threei_request *)1UL)
+
 enum threei_copy_type {
     THREEI_COPY_MEMCPY  = 0,   /* RawMemcpy: exact `len` bytes            */
     THREEI_COPY_STRNCPY = 1,   /* Strncpy:   NUL-terminated, bounded by len */
@@ -186,6 +190,19 @@ struct threei_arena {
 	size_t size;
 };
 
+enum threei_idtype {
+	THREEI_ID_GETPID,
+	THREEI_ID_GETTID,
+	THREEI_ID_GETPPID,
+	THREEI_ID_GETPGID,
+	THREEI_ID_GETSID,
+};
+bool threei_is_identity_op(u32 syscall_nr);
+long threei_run_identity_op(pid_t target_cage, u32 syscall_nr,
+			    unsigned long args[6]);
+bool threei_identity_override(enum threei_idtype type, pid_t *out);
+struct task_struct *threei_identity_task(void);
+
 void put_handler_result(struct handler_result *res);
 bool check_handler_exists(pid_t cageid);
 void __drop_handlers(struct task_struct *task);
@@ -225,8 +242,9 @@ bool threei_drain_injection(unsigned long self_nr, unsigned long args[6],
 
 void threei_exec_commit_notify(void);
 
-unsigned long threei_arena_get(struct task_struct *cage);
+unsigned long threei_arena_get(struct task_struct *cage, size_t need);
 void threei_arena_free(struct task_struct *task);
+long threei_stage_in_args(pid_t primary, u32 nr, const s32 arg_cage[6], unsigned long args[6]);
 
 int  threei_promote_grate(struct task_struct *grate);
 void threei_set_cage_sched(struct task_struct *cage);

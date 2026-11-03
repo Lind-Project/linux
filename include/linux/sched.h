@@ -1622,6 +1622,7 @@ struct task_struct {
     struct threei_inject		*threei_inject;
     struct threei_ctx_borrow		*threei_ctx_borrow;
     struct threei_arena			*threei_arena;
+    struct threei_request		*threei_fwd_req;
     struct threei_ctx_cache		*threei_ctx_cache;
 #endif
 

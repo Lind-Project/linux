@@ -64,11 +64,6 @@ static inline struct threei_ring *threei_grate_setup(void) {
     return (r < 0) ? NULL : (struct threei_ring *)(unsigned long)r;
 }
 
-static inline unsigned long threei_arena_setup(pid_t cageid) {
-    long r = syscall(__NR_threei_arena_setup, cageid);
-    return (r < 0) ? 0 : (unsigned long)r;
-}
-
 /* dispatch helpers */
 static inline long __threei_dispatch(struct threei_req_user *req) {
     threei_handler_fn fn =

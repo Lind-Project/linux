@@ -8,20 +8,7 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/threei.h>
-
-struct threei_ctx_borrow {
-	const struct cred *cage_cred;
-	struct mm_struct *cage_mm;
-	struct files_struct *cage_files;
-	struct fs_struct *cage_fs;
-	struct nsproxy *cage_nsproxy;
-
-	const struct cred *old_cred;
-	struct mm_struct *old_mm;
-	struct files_struct *old_files;
-	struct fs_struct *old_fs;
-	struct nsproxy *old_nsproxy;
-};
+#include <linux/threei_types.h>
 
 static bool ctx_borrow_cred(struct threei_ctx_borrow *borrow,
 			    struct task_struct *cage)
@@ -246,6 +233,7 @@ long threei_run_in_cage_ctx(pid_t target_cage, u32 syscall_nr,
 	}
 
 	cage = find_get_task_by_vpid(target_cage);
+
 	if (!cage) {
 		return -ESRCH;
 	}
@@ -275,7 +263,7 @@ long threei_run_in_cage_ctx(pid_t target_cage, u32 syscall_nr,
 		goto out_restore;
 	}
 
-	current->threei_ctx_borrow = &borrow;
+	borrow.id_cage = cage;
 
 	/* publish so threei_exit can unwind us if the grate is killed while
 	 * blocked in the dispatch below. */

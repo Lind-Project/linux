@@ -7,6 +7,7 @@
 #include <linux/kmsan.h>
 #include <linux/livepatch.h>
 #include <linux/tick.h>
+#include <linux/threei.h>
 
 /* Workaround to allow gradual conversion of architecture code */
 void __weak arch_do_signal_or_restart(struct pt_regs *regs) { }
@@ -65,6 +66,11 @@ static __always_inline unsigned long __exit_to_user_mode_loop(struct pt_regs *re
 
 		if (ti_work & _TIF_NOTIFY_RESUME)
 			resume_user_mode_work(regs);
+
+#ifdef CONFIG_THREEI
+		if (ti_work & _TIF_NOTIFY_THREEI)
+			threei_notify_resume(regs);
+#endif
 
 		/* Architecture specific TIF work */
 		arch_exit_to_user_mode_work(regs, ti_work);

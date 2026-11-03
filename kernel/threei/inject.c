@@ -27,9 +27,120 @@ bool threei_is_thread_op(u32 syscall_nr)
 #ifdef __NR_execveat
 	case __NR_execveat:
 #endif
+#ifdef __NR_futex
+	case __NR_futex:
+#endif
+#ifdef __NR_futex_time32
+	case __NR_futex_time32:
+#endif
+#ifdef __NR_futex_waitv
+	case __NR_futex_waitv:
+#endif
+#ifdef __NR_futex_wait
+	case __NR_futex_wait:
+#endif
+#ifdef __NR_futex_wake
+	case __NR_futex_wake:
+#endif
+#ifdef __NR_futex_requeue
+	case __NR_futex_requeue:
+#endif
+#ifdef __NR_set_robust_list
+	case __NR_set_robust_list:
+#endif
+#ifdef __NR_get_robust_list
+	case __NR_get_robust_list:
+#endif
 #ifdef __NR_rt_sigreturn
 	case __NR_rt_sigreturn:
 #endif
+#ifdef __NR_rt_sigaction
+	case __NR_rt_sigaction:
+#endif
+#ifdef __NR_rt_sigprocmask
+	case __NR_rt_sigprocmask:
+#endif
+#ifdef __NR_rt_sigpending
+	case __NR_rt_sigpending:
+#endif
+#ifdef __NR_rt_sigsuspend
+	case __NR_rt_sigsuspend:
+#endif
+#ifdef __NR_rt_sigtimedwait
+	case __NR_rt_sigtimedwait:
+#endif
+#ifdef __NR_rt_sigtimedwait_time64
+	case __NR_rt_sigtimedwait_time64:
+#endif
+#ifdef __NR_sigaltstack
+	case __NR_sigaltstack:
+#endif
+#ifdef __NR_rt_sigqueueinfo
+	case __NR_rt_sigqueueinfo:
+#endif
+#ifdef __NR_rt_tgsigqueueinfo
+	case __NR_rt_tgsigqueueinfo:
+#endif
+#ifdef __NR_kill
+	case __NR_kill:
+#endif
+#ifdef __NR_tkill
+	case __NR_tkill:
+#endif
+#ifdef __NR_tgkill
+	case __NR_tgkill:
+#endif
+#ifdef __NR_pidfd_send_signal
+	case __NR_pidfd_send_signal:
+#endif
+#ifdef __NR_signalfd4
+	case __NR_signalfd4:
+#endif
+#ifdef __NR_signalfd
+	case __NR_signalfd:
+#endif
+
+#ifdef __NR_setuid
+	case __NR_setuid:
+#endif
+#ifdef __NR_setgid
+	case __NR_setgid:
+#endif
+#ifdef __NR_setreuid
+	case __NR_setreuid:
+#endif
+#ifdef __NR_setregid
+	case __NR_setregid:
+#endif
+#ifdef __NR_setresuid
+	case __NR_setresuid:
+#endif
+#ifdef __NR_setresgid
+	case __NR_setresgid:
+#endif
+#ifdef __NR_setfsuid
+	case __NR_setfsuid:
+#endif
+#ifdef __NR_setfsgid
+	case __NR_setfsgid:
+#endif
+#ifdef __NR_setgroups
+	case __NR_setgroups:
+#endif
+#ifdef __NR_capset
+	case __NR_capset:
+#endif
+#ifdef __NR_setpgid
+	case __NR_setpgid:
+#endif
+#ifdef __NR_setsid
+	case __NR_setsid:
+#endif
+
+#ifdef __NR_ptrace
+	case __NR_ptrace:
+#endif
+
 #ifdef __NR_exit
 	case __NR_exit:
 #endif
@@ -75,6 +186,7 @@ bool threei_drain_injection(unsigned long self_nr, unsigned long args[6],
 			complete(inject->done);
 			threei_inject_put(inject);
 		}
+		clear_notify_signal();
 		*run_native = true;
 		return true;
 	}
@@ -119,7 +231,18 @@ long threei_inject_call(pid_t target, u32 syscall_nr, unsigned long args[6])
 
 	/* publish the slot, then force the target to a return-to-user boundary */
 	WRITE_ONCE(task->threei_inject, inject);
-	set_tsk_thread_flag(task, TIF_NOTIFY_RESUME);
+	{
+		struct threei_request *fwd = READ_ONCE(task->threei_fwd_req);
+		if (fwd == THREEI_FWD_SPIN) {
+			/* ring spinner: drains itself, needs no wake */
+		} else if (fwd) {
+			complete(&fwd->done);
+		} else {
+			set_tsk_thread_flag(task, TIF_NOTIFY_THREEI);
+			/* out-of-band: break a foreign sleep */
+			set_notify_signal(task);
+		}
+	}
 	set_notify_signal(task);
 	wake_up_state(task, TASK_INTERRUPTIBLE);
 

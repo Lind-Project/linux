@@ -351,6 +351,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 	set_bit(slot_idx, (unsigned long *)&ring->pending_mask);
 
 	/* spin for the grate's reply */
+	WRITE_ONCE(current->threei_fwd_req, THREEI_FWD_SPIN);
 	spins = 0;
 	u64 deadline = local_clock() + THREEI_SPIN_BUDGET;
 	while (smp_load_acquire(&slot->state) != THREEI_SLOT_DONE) {
@@ -361,11 +362,13 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 			spins = 0;
 			if (READ_ONCE(ctx->dead)) {
 				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
 				*out = -ESRCH;
 				return true;
 			}
 			if (fatal_signal_pending(current)) {
 				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
 				*out = -EINTR;
 				return true;
 			}
@@ -373,6 +376,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 			if (threei_drain_injection(nr, args, &run_native) &&
 			    run_native) {
 				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
 				*out = THREEI_ALLOW;
 				return true;
 			}
@@ -380,6 +384,7 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 			if (local_clock() > deadline) {
 				if (threei_slot_reclaim(ring, slot_idx)) {
 					/* reclaimed: the grate never saw it. safe to resubmit */
+					WRITE_ONCE(current->threei_fwd_req, NULL);
 					return false; /* forward_via_completion */
 				}
 				grate_claimed = true;
@@ -394,12 +399,13 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 	WRITE_ONCE(slot->state, THREEI_SLOT_FREE);
 	smp_mb__before_atomic();
 	set_bit(slot_idx, (unsigned long *)&ring->free_mask);
+	WRITE_ONCE(current->threei_fwd_req, NULL);
 	return true;
 }
 
-/* poll interval for checking an injection while blocked on the completion
- * path (completions don't wake us for injections; TIF_NOTIFY_RESUME also
- * pulls us out, this is the backstop). */
+/* Backstop poll interval while blocked on the completion path. The prompt
+ * path is threei_inject_call's complete(&req->done) nudge (no signal); this
+ * timeout only bounds the wait if that wake is ever missed. */
 #define THREEI_INJECT_POLL_MS 20
 
 /* slow path: completion + waitqueue */
@@ -428,37 +434,50 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
 	spin_unlock(&ctx->lock);
 	wake_up_interruptible_sync(&ctx->recv_wq);
 
+	/* publish the live request so threei_inject_call() can wake this exact
+	 * wait with a plain complete(&req.done), no signal required.*/
+	WRITE_ONCE(current->threei_fwd_req, &req);
+
 	for (;;) {
+		bool run_native = false;
+
 		ret = wait_for_completion_interruptible_timeout(
 			&req.done, msecs_to_jiffies(THREEI_INJECT_POLL_MS));
 
-		if (ret > 0) {
+		/* only a real grate response (threei_respond/threei_exit) sets this;
+		 * an injection nudge wakes us with completed still false */
+		if (READ_ONCE(req.completed)) {
 			break;
 		}
 
-		if (ret == 0) {
-			bool run_native = false;
-
-			if (threei_drain_injection(nr, args, &run_native) &&
-			    run_native) {
-				spin_lock(&ctx->lock);
-				if (!req.completed) {
-					list_del(&req.node);
-				}
-				spin_unlock(&ctx->lock);
-				return native_syscall(nr, args);
+		/* woken without a response: either the injection nudge (a plain
+		 * complete() from threei_inject_call, no signal) or the poll-timeout
+		 * backstop. service a pending injection in the cage's own context. */
+		if (threei_drain_injection(nr, args, &run_native) &&
+			run_native) {
+			WRITE_ONCE(current->threei_fwd_req, NULL);
+			spin_lock(&ctx->lock);
+			if (!req.completed) {
+				list_del(&req.node);
 			}
-			continue;
-		}
-		spin_lock(&ctx->lock);
-		if (!req.completed) {
-			list_del(&req.node);
 			spin_unlock(&ctx->lock);
-			return -EINTR;
+			return native_syscall(nr, args);
 		}
-		spin_unlock(&ctx->lock);
-		break;
+
+		if (ret < 0 && test_thread_flag(TIF_SIGPENDING)) {
+			spin_lock(&ctx->lock);
+			if (!req.completed) {
+				list_del(&req.node);
+				spin_unlock(&ctx->lock);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
+				return -EINTR;
+			}
+			spin_unlock(&ctx->lock);
+			break;
+		}
+
 	}
+	WRITE_ONCE(current->threei_fwd_req, NULL);
 	return req.retval;
 }
 
@@ -532,6 +551,10 @@ forward:
 long threei_forward_dispatch(pid_t cage, u32 syscall_nr, const s32 arg_cage[6],
 			     unsigned long args[6])
 {
+	long ret = threei_stage_in_args(cage, syscall_nr, arg_cage, args);
+	if (ret) {
+		return ret;
+	}
 	if (threei_is_thread_op(syscall_nr)) {
 		return threei_inject_call(cage, syscall_nr, args);
 	}
@@ -560,6 +583,12 @@ static long __route_current(u32 syscall_nr, pid_t primary_cage,
 	return native_syscall(syscall_nr, args);
 }
 
+static bool threei_is_control_op(u32 nr)
+{
+	return nr == __NR_register_handler ||
+	       nr == __NR_copy_data_between_cages;
+}
+
 /*
  * threei entry gate. all the syscalls made by a cage which has handler
  * registered against it lands here. This path is userful for:
@@ -578,6 +607,12 @@ bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result)
 {
 	struct handler_result handler;
 	long verdict;
+
+	if (threei_is_control_op(syscall_nr) &&
+	    get_handler(__NR_make_threei_call, &handler) == 0) {
+		*result = -EPERM;
+		return true;
+	}
 
 	if (get_handler(syscall_nr, &handler) == 0) {
 		verdict = forward_to_grate(&handler, syscall_nr,
@@ -1006,7 +1041,7 @@ int copy_threei(struct task_struct *p)
 /* threei_exit - exit teardown */
 void threei_exit(struct task_struct *task)
 {
-	struct threei_grate_ctx *ctx;
+	struct threei_grate_ctx *ctx = NULL;
 	struct threei_handler *handler;
 	struct task_struct *grate;
 	struct threei_inject *inj;
@@ -1048,9 +1083,9 @@ void threei_exit(struct task_struct *task)
 		for_each_set_bit(nr, handler->registered, NR_syscalls) {
 			grate = find_task_by_vpid(handler->table[nr].grateid);
 			if (grate) {
-				ctx = rcu_dereference(grate->threei_grate_ctx);
-				if (ctx) {
-					wake_up(&ctx->recv_wq);
+				struct threei_grate_ctx *wctx = rcu_dereference(grate->threei_grate_ctx);
+				if (wctx) {
+					wake_up(&wctx->recv_wq);
 				}
 			}
 			/*one wake is enough*/
