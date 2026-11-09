@@ -188,6 +188,9 @@ struct threei_ctx_borrow;
 struct threei_arena {
 	unsigned long base;
 	size_t size;
+	/* kernel owned backing: cage cannot reach these */
+	struct page	**pages;
+	unsigned long	npages;
 };
 
 enum threei_idtype {
@@ -245,6 +248,8 @@ void threei_exec_commit_notify(void);
 unsigned long threei_arena_get(struct task_struct *cage, size_t need);
 void threei_arena_free(struct task_struct *task);
 long threei_stage_in_args(pid_t primary, u32 nr, const s32 arg_cage[6], unsigned long args[6]);
+long threei_arena_write(struct threei_arena *arena, unsigned long at,
+			const void *src, size_t len);
 
 int  threei_promote_grate(struct task_struct *grate);
 void threei_set_cage_sched(struct task_struct *cage);

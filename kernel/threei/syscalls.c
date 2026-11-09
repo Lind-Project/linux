@@ -318,8 +318,7 @@ static long threei_arena_put(struct task_struct *cage, unsigned long *cursor,
 	if (cursor_at + ALIGN(len, 8) > limit) {
 		return -EFAULT;
 	}
-	if (access_process_vm(cage, cursor_at, (void *)kbuf, len, FOLL_WRITE) !=
-	    (long)len) {
+	if (threei_arena_write(cage->threei_arena, cursor_at, kbuf, len) != 0) {
 		return -EFAULT;
 	}
 	*cursor = cursor_at + ALIGN(len, 8);
@@ -431,8 +430,7 @@ static long threei_stage_iovec(struct task_struct *cage, pid_t owner,
 		iov[j].iov_base = (void __user *)(unsigned long)cursor_at;
 	}
 
-	if (access_process_vm(cage, arr_at, iov, arrsz, FOLL_WRITE) !=
-	    (long)arrsz) {
+	if (threei_arena_write(cage->threei_arena, arr_at, iov, arrsz) != 0) {
 		rc = -EFAULT;
 		goto out;
 	}
