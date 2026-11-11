@@ -280,71 +280,6 @@ static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx)
 	return true;
 }
 
-/*
- * depricated since copy should be only made when requested explicitly.
- * will remove it in the future Only syscalls listed here get their
- * pointer arguments copied into the slot's inline data[] buffer so the
- * grate can dereference them directly. Anything not listed is treated as
- * all-scalar (no marshaling), which is correct for syscalls like geteuid.
- */
-
-/*
-static const struct threei_syscall_desc *threei_get_desc(u32 nr)
-{
-	if (nr < ARRAY_SIZE(threei_descs)) {
-		return &threei_descs[nr];
-	}
-	return NULL; // scalrs
-}
-
-static long threei_marshal_into_slot(struct threei_ring_slot *slot, u32 nr,
-				     unsigned long args[6])
-{
-	const struct threei_syscall_desc *desc = threei_get_desc(nr);
-	u32 off = 0;
-	int i;
-
-	slot->arg_is_ptr = 0;
-
-	for (i = 0; i < 6; i++) {
-		if (desc && desc->args[i].type == ARG_IN_PTR && args[i]) {
-			if (desc->args[i].size == 0) {
-				long n = strncpy_from_user(
-					slot->data + off,
-					(void __user *)args[i],
-					THREEI_SLOT_DATA - off);
-				if (n < 0) {
-					return -EFAULT;
-				}
-				if (n >= (long)(THREEI_SLOT_DATA - off)) {
-					return -E2BIG;
-				}
-				slot->args[i] = off;
-				slot->arg_is_ptr |= (1ULL << i);
-				off += n + 1;
-			} else {
-				u32 sz = desc->args[i].size;
-
-				if (off + sz > THREEI_SLOT_DATA) {
-					return -E2BIG;
-				}
-				if (copy_from_user(slot->data + off,
-						   (void __user *)args[i],
-						   sz)) {
-					return -EFAULT;
-				}
-				slot->args[i] = off;
-				slot->arg_is_ptr |= (1ULL << i);
-				off += sz;
-			}
-		} else {
-			slot->args[i] = args[i];
-		}
-	}
-	return 0;
-}
-*/
-
 /* fast path: shared-ring spin
  *
  * Try to forward via the shared ring. Returns true if the ring path was
@@ -397,7 +332,6 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 	}
 
 	slot = &ring->slots[slot_idx];
-
 	WRITE_ONCE(slot->state, THREEI_SLOT_CLAIMED);
 
 	slot->nr = nr;
@@ -411,72 +345,46 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 		memset(slot->arg_cage, 0, sizeof(slot->arg_cage));
 	}
 
-	/* removed support for automated pointer argument translation */
-	/*
-	ret = threei_marshal_into_slot(slot, nr, args);
-	if (ret) {
-		smp_store_release(&slot->state, THREEI_SLOT_FREE);
-		*out = ret;
-		return true;
-	}
-	*/
-
 	/* publish: CLAIMED -> PENDING, then the bit */
 	smp_store_release(&slot->state, THREEI_SLOT_PENDING);
 	smp_mb__before_atomic();
 	set_bit(slot_idx, (unsigned long *)&ring->pending_mask);
 
 	/* spin for the grate's reply */
+	WRITE_ONCE(current->threei_fwd_req, THREEI_FWD_SPIN);
 	spins = 0;
 	u64 deadline = local_clock() + THREEI_SPIN_BUDGET;
 	while (smp_load_acquire(&slot->state) != THREEI_SLOT_DONE) {
 		cpu_relax();
 		if (++spins >= THREEI_SPIN_BUDGET) {
+			bool run_native = false;
+
 			spins = 0;
 			if (READ_ONCE(ctx->dead)) {
 				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
 				*out = -ESRCH;
 				return true;
 			}
 			if (fatal_signal_pending(current)) {
 				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
 				*out = -EINTR;
 				return true;
 			}
-			/* avoid circular wait between the cage and the grate.
-			* the cage waits for the grate to mark its slot DONE,
-			* the grate waits for the cage to complete the inject,
-			* the cage can't complete the inject because it's busy
-			* waiting for the grate */
-			{
-				struct threei_inject *inj =
-					READ_ONCE(current->threei_inject);
 
-				/* the grate has forwarded back to me the very syscall
-				* I'm currently blocked forwarding */
-				if (inj && READ_ONCE(inj->active) &&
-				    inj->nr == nr) {
-					current->threei_inject = NULL;
-					smp_rmb();
-
-					/* forwarded args become THIS syscall's args -> regs */
-					memcpy(args, inj->args,
-					       sizeof(inj->args));
-
-					inj->ret = 0;
-					inj->active = false;
-					complete(
-						inj->done); /* release the grate */
-					threei_inject_put(inj);
-
-					threei_slot_reclaim(ring, slot_idx);
-					*out = THREEI_ALLOW; /* native over args[] */
-					return true;
-				}
+			if (threei_drain_injection(nr, args, &run_native) &&
+			    run_native) {
+				threei_slot_reclaim(ring, slot_idx);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
+				*out = THREEI_ALLOW;
+				return true;
 			}
+
 			if (local_clock() > deadline) {
 				if (threei_slot_reclaim(ring, slot_idx)) {
 					/* reclaimed: the grate never saw it. safe to resubmit */
+					WRITE_ONCE(current->threei_fwd_req, NULL);
 					return false; /* forward_via_completion */
 				}
 				grate_claimed = true;
@@ -491,8 +399,14 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 	WRITE_ONCE(slot->state, THREEI_SLOT_FREE);
 	smp_mb__before_atomic();
 	set_bit(slot_idx, (unsigned long *)&ring->free_mask);
+	WRITE_ONCE(current->threei_fwd_req, NULL);
 	return true;
 }
+
+/* Backstop poll interval while blocked on the completion path. The prompt
+ * path is threei_inject_call's complete(&req->done) nudge (no signal); this
+ * timeout only bounds the wait if that wake is ever missed. */
+#define THREEI_INJECT_POLL_MS 20
 
 /* slow path: completion + waitqueue */
 static long forward_via_completion(struct threei_grate_ctx *ctx,
@@ -520,17 +434,50 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
 	spin_unlock(&ctx->lock);
 	wake_up_interruptible_sync(&ctx->recv_wq);
 
-	ret = wait_for_completion_interruptible(&req.done);
-	if (ret) {
-		spin_lock(&ctx->lock);
-		if (!req.completed) {
-			list_del(&req.node);
-			spin_unlock(&ctx->lock);
-			return -EINTR;
+	/* publish the live request so threei_inject_call() can wake this exact
+	 * wait with a plain complete(&req.done), no signal required.*/
+	WRITE_ONCE(current->threei_fwd_req, &req);
+
+	for (;;) {
+		bool run_native = false;
+
+		ret = wait_for_completion_interruptible_timeout(
+			&req.done, msecs_to_jiffies(THREEI_INJECT_POLL_MS));
+
+		/* only a real grate response (threei_respond/threei_exit) sets this;
+		 * an injection nudge wakes us with completed still false */
+		if (READ_ONCE(req.completed)) {
+			break;
 		}
-		/* grate completed it between our wakeup and the lock */
-		spin_unlock(&ctx->lock);
+
+		/* woken without a response: either the injection nudge (a plain
+		 * complete() from threei_inject_call, no signal) or the poll-timeout
+		 * backstop. service a pending injection in the cage's own context. */
+		if (threei_drain_injection(nr, args, &run_native) &&
+			run_native) {
+			WRITE_ONCE(current->threei_fwd_req, NULL);
+			spin_lock(&ctx->lock);
+			if (!req.completed) {
+				list_del(&req.node);
+			}
+			spin_unlock(&ctx->lock);
+			return native_syscall(nr, args);
+		}
+
+		if (ret < 0 && test_thread_flag(TIF_SIGPENDING)) {
+			spin_lock(&ctx->lock);
+			if (!req.completed) {
+				list_del(&req.node);
+				spin_unlock(&ctx->lock);
+				WRITE_ONCE(current->threei_fwd_req, NULL);
+				return -EINTR;
+			}
+			spin_unlock(&ctx->lock);
+			break;
+		}
+
 	}
+	WRITE_ONCE(current->threei_fwd_req, NULL);
 	return req.retval;
 }
 
@@ -601,6 +548,20 @@ forward:
 				      args);
 }
 
+long threei_forward_dispatch(pid_t cage, u32 syscall_nr, const s32 arg_cage[6],
+			     unsigned long args[6])
+{
+	long ret = threei_stage_in_args(cage, syscall_nr, arg_cage, args);
+	if (ret) {
+		return ret;
+	}
+	if (threei_is_thread_op(syscall_nr)) {
+		return threei_inject_call(cage, syscall_nr, args);
+	}
+
+	return threei_run_in_cage_ctx(cage, syscall_nr, args);
+}
+
 /* FD Translation routine */
 
 /* The shared routing decision, against current's table. */
@@ -608,117 +569,25 @@ static long __route_current(u32 syscall_nr, pid_t primary_cage,
 			    const s32 arg_cage[6], unsigned long args[6])
 {
 	struct handler_result handler;
-	struct threei_handler *cage_handler = NULL;
-	struct task_struct *cage_task;
-	const struct threei_fd_desc *desc;
-	int orig_vfd_arg0 = (int)args[0]; /* save before translation */
-	bool have_handler, handled = false;
-	long ret;
 
-	rcu_read_lock();
-	cage_task = find_task_by_vpid(primary_cage);
-	if (cage_task) {
-		get_task_struct(cage_task);
-		cage_handler = rcu_dereference(cage_task->threei_handler);
-		if (cage_handler &&
-		    !refcount_inc_not_zero(&cage_handler->refs)) {
-			cage_handler = NULL;
-		}
-	}
-	rcu_read_unlock();
-
-	have_handler = (get_handler(syscall_nr, &handler) == 0);
-	desc = threei_get_fd_desc(syscall_nr);
-	/*
-	* Generic isolation-preserving path: descriptor exists, takes an fd,
-	* but the grate registered NO handler for it. Execute against the
-	* grate's file* here. current is the grate on this path (we are acting
-	* on behalf of primary_cage), so pass cage_task. the buffer copies
-	* must target the cage's address space via access_process_vm, not
-	* current's.
-	*/
-	if (!have_handler && cage_handler && desc && desc->arg_is_fd) {
-		ret = threei_generic_fd_exec(cage_task, syscall_nr, desc, args,
-					     &handled);
-		if (handled) {
-			/* postprocess for FREES_FD0 (close): free the vfd slot.
-			* orig_vfd_arg0 holds the pre-translation vfd. */
-			ret = threei_postprocess_fd(cage_task, syscall_nr, 0,
-						    orig_vfd_arg0, ret);
-			refcount_dec(&cage_handler->refs);
-			put_task_struct(cage_task);
-			return ret;
-		}
-		/* not handled (e.g. native fd, or syscall we don't implement).
-		* fall through to normal translate + forward/native below */
+	if (get_handler(syscall_nr, &handler) == 0) {
+		return forward_to_grate(&handler, syscall_nr, primary_cage,
+					arg_cage, args);
 	}
 
-	/*
-	* run the syscall: forward to a further grate if one is registered
-	* against current, else run it natively here. Either way we get a
-	* return value we then postprocess.
-	*/
-	have_handler = (get_handler(syscall_nr, &handler) == 0);
-	if (have_handler) {
-		ret = forward_to_grate(&handler, syscall_nr, primary_cage,
-				       arg_cage, args);
-	} else if (primary_cage != 0 && primary_cage != task_tgid_nr(current) &&
-		   threei_is_thread_op(syscall_nr)) {
-		ret = threei_inject_call(primary_cage, syscall_nr, args);
-	} else if (primary_cage != 0 && primary_cage != task_tgid_nr(current) &&
-		   threei_is_mm_op(syscall_nr)) {
-		ret = threei_run_mm_op(syscall_nr, primary_cage, arg_cage,
-				       args);
-	} else {
-		ret = native_syscall(syscall_nr, args);
+	if (primary_cage != 0 && primary_cage != task_tgid_nr(current)) {
+		return threei_forward_dispatch(primary_cage, syscall_nr,
+					       arg_cage, args);
 	}
 
-	if (cage_handler) {
-		pid_t grateid = have_handler ? handler.grateid :
-					       task_tgid_nr(current);
-		ret = threei_postprocess_fd(cage_task, syscall_nr, grateid,
-					    orig_vfd_arg0, ret);
-		refcount_dec(&cage_handler->refs);
-	}
-	if (cage_task) {
-		put_task_struct(cage_task);
-	}
-	return ret;
+	return native_syscall(syscall_nr, args);
 }
 
-/*
-static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd)
+static bool threei_is_control_op(u32 nr)
 {
-	struct task_struct *grate;
-	struct file *file;
-	int cage_fd;
-
-	rcu_read_lock();
-	grate = find_task_by_vpid(grateid);
-	if (grate) {
-		get_task_struct(grate);
-	}
-	rcu_read_unlock();
-	if (!grate) {
-		return -ESRCH;
-	}
-
-	// get struct file* for an fd in a specific task
-	file = fget_task(grate, real_fd);
-	put_task_struct(grate);
-	if (!file) {
-		return -EBADF;
-	}
-
-	cage_fd = get_unused_fd_flags(0);
-	if (cage_fd < 0) {
-		fput(file);
-		return cage_fd;
-	}
-	fd_install(cage_fd, file);
-	return cage_fd;
+	return nr == __NR_register_handler ||
+	       nr == __NR_copy_data_between_cages;
 }
-*/
 
 /*
  * threei entry gate. all the syscalls made by a cage which has handler
@@ -737,54 +606,22 @@ static int threei_install_grate_fd_into_cage(pid_t grateid, int real_fd)
 bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result)
 {
 	struct handler_result handler;
-	const struct threei_fd_desc *fdesc;
 	long verdict;
+
+	if (threei_is_control_op(syscall_nr) &&
+	    get_handler(__NR_make_threei_call, &handler) == 0) {
+		*result = -EPERM;
+		return true;
+	}
 
 	if (get_handler(syscall_nr, &handler) == 0) {
 		verdict = forward_to_grate(&handler, syscall_nr,
 					   task_tgid_nr(current), NULL, args);
-		/* handler exists: forward to the grate (active mediation) */
 		if (verdict == THREEI_ALLOW) {
 			return false;
 		}
 		*result = verdict;
 		return true;
-	}
-
-	fdesc = threei_get_fd_desc(syscall_nr);
-	if (fdesc && (fdesc->flags & THREEI_ARG_IS_FD_MAP)) {
-		threei_gate_map_fd(fdesc, args);
-		return false;
-	}
-
-	if (fdesc && fdesc->arg_is_fd) {
-		struct threei_handler *ch;
-		bool handled = false;
-		long ret;
-
-		rcu_read_lock();
-		ch = rcu_dereference(current->threei_handler);
-		if (ch && !refcount_inc_not_zero(&ch->refs)) {
-			ch = NULL;
-		}
-		rcu_read_unlock();
-
-		if (ch) {
-			int orig_vfd = (int)args[0];
-
-			ret = threei_generic_fd_exec(NULL, syscall_nr, fdesc,
-						     args, &handled);
-
-			if (handled) {
-				/* FREES_FD0 (close): free the vfd slot */
-				ret = threei_postprocess_fd(NULL, syscall_nr, 0,
-							    orig_vfd, ret);
-				refcount_dec(&ch->refs);
-				*result = ret;
-				return true;
-			}
-			refcount_dec(&ch->refs);
-		}
 	}
 	return false;
 }
@@ -1169,18 +1006,12 @@ SYSCALL_DEFINE2(threei_respond, u64, id, long, retval)
 int copy_threei(struct task_struct *p)
 {
 	struct threei_handler *handler;
-	struct threei_fdtable *parent_tbl;
 
-	/* a fork must never inherit a pending injection */
 	p->threei_inject = NULL;
-	/*
-	* A grate receive context is per-task and must NOT be inherited: the
-	* child is a different task with its own (initially absent) context.
-	*
-	* similar is the case with threei_fdtable and  */
 	p->threei_grate_ctx = NULL;
-	p->threei_fdtable = NULL;
 	p->threei_ctx_cache = NULL;
+	p->threei_ctx_borrow = NULL;
+	p->threei_arena = NULL;
 
 	rcu_read_lock();
 	handler = rcu_dereference(current->threei_handler);
@@ -1204,28 +1035,26 @@ int copy_threei(struct task_struct *p)
 		clear_task_syscall_work(p, THREEI);
 	}
 
-	/*
-	* clone the parent cage's vfd table (real fork() duplicates the
-	* descriptor table; sharing it would let the child's close() free
-	* parent's descriptors
-	*/
-	parent_tbl = threei_fdtable_lookup_get(current);
-	if (parent_tbl) {
-		p->threei_fdtable = threei_fdtable_clone(parent_tbl);
-		threei_fdtable_put(parent_tbl);
-	}
-
 	return 0;
 }
 
 /* threei_exit - exit teardown */
 void threei_exit(struct task_struct *task)
 {
-	struct threei_grate_ctx *ctx;
+	struct threei_grate_ctx *ctx = NULL;
 	struct threei_handler *handler;
 	struct task_struct *grate;
 	struct threei_inject *inj;
-	struct threei_fdtable *fdtable;
+
+	/*
+	 * If we are dying mid-forward with a borrowed cage context still
+	 * installed (killed while blocked in threei_run_in_cage_ctx), unwind
+	 * it first.
+	 */
+	threei_ctx_restore_emergency(task);
+
+	/* free the lazily-reserved arena tracker (mapping dies with the mm) */
+	threei_arena_free(task);
 
 	/*
 	* If this task dies with an injected syscall still pending, unblock
@@ -1234,7 +1063,7 @@ void threei_exit(struct task_struct *task)
 	inj = task->threei_inject;
 	if (inj) {
 		task->threei_inject = NULL;
-		if (READ_ONCE(inj->active)) {
+		if (atomic_cmpxchg(&inj->completed, 0, 1) == 0) {
 			inj->ret = -ESRCH;
 			inj->active = false;
 			complete(inj->done);
@@ -1242,9 +1071,7 @@ void threei_exit(struct task_struct *task)
 		threei_inject_put(inj);
 	}
 
-	task->threei_inject = NULL;
-
-	/* free  for the cage */
+	/* free cache for the cage */
 	threei_cache_free(task);
 
 	/* before dropping the table, find any registered grate and wake it */
@@ -1256,9 +1083,9 @@ void threei_exit(struct task_struct *task)
 		for_each_set_bit(nr, handler->registered, NR_syscalls) {
 			grate = find_task_by_vpid(handler->table[nr].grateid);
 			if (grate) {
-				ctx = rcu_dereference(grate->threei_grate_ctx);
-				if (ctx) {
-					wake_up(&ctx->recv_wq);
+				struct threei_grate_ctx *wctx = rcu_dereference(grate->threei_grate_ctx);
+				if (wctx) {
+					wake_up(&wctx->recv_wq);
 				}
 			}
 			/*one wake is enough*/
@@ -1277,12 +1104,7 @@ void threei_exit(struct task_struct *task)
 			task->threei_grate_ctx,
 			lockdep_is_held(&task->alloc_lock));
 		rcu_assign_pointer(task->threei_grate_ctx, NULL);
-		fdtable = rcu_dereference_protected(
-			task->threei_fdtable,
-			lockdep_is_held(&task->alloc_lock));
-		rcu_assign_pointer(task->threei_fdtable, NULL);
 		task_unlock(task);
-		threei_fdtable_put(fdtable);
 	}
 
 	if (ctx) {

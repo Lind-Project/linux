@@ -1,1 +1,1 @@
-obj-y += threei.o fd.o handler.o mm.o inject.o sched.o
+obj-y += threei.o handler.o inject.o sched.o inject_core.o hooks.o ctx.o arena.o syscalls.o

@@ -78,6 +78,8 @@
 
 #include <trace/events/task.h>
 
+#include <linux/threei.h>
+
 #include "uid16.h"
 
 #ifndef SET_UNALIGN_CTL
@@ -998,12 +1000,23 @@ SYSCALL_DEFINE1(setfsgid, gid_t, gid)
  */
 SYSCALL_DEFINE0(getpid)
 {
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (threei_identity_override(THREEI_ID_GETPID, &id)) {
+		return id;
+	}
+#endif
 	return task_tgid_vnr(current);
 }
 
 /* Thread ID - the internal kernel "pid" */
 SYSCALL_DEFINE0(gettid)
 {
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (threei_identity_override(THREEI_ID_GETTID, &id))
+		return id;
+#endif
 	return task_pid_vnr(current);
 }
 
@@ -1016,7 +1029,12 @@ SYSCALL_DEFINE0(gettid)
 SYSCALL_DEFINE0(getppid)
 {
 	int pid;
-
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (threei_identity_override(THREEI_ID_GETPPID, &id)) {
+		return id;
+	}
+#endif
 	rcu_read_lock();
 	pid = task_tgid_vnr(rcu_dereference(current->real_parent));
 	rcu_read_unlock();
@@ -1214,6 +1232,11 @@ out:
 
 SYSCALL_DEFINE1(getpgid, pid_t, pid)
 {
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (pid == 0 && threei_identity_override(THREEI_ID_GETPGID, &id))
+		return id;
+#endif
 	return do_getpgid(pid);
 }
 
@@ -1221,6 +1244,12 @@ SYSCALL_DEFINE1(getpgid, pid_t, pid)
 
 SYSCALL_DEFINE0(getpgrp)
 {
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (threei_identity_override(THREEI_ID_GETPGID, &id)) {
+		return id;
+	}
+#endif
 	return do_getpgid(0);
 }
 
@@ -1232,6 +1261,12 @@ SYSCALL_DEFINE1(getsid, pid_t, pid)
 	struct pid *sid;
 	int retval;
 
+#ifdef CONFIG_THREEI
+	pid_t id;
+	if (threei_identity_override(THREEI_ID_GETSID, &id)) {
+		return id;
+	}
+#endif
 	rcu_read_lock();
 	if (!pid)
 		sid = task_session(current);

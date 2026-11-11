@@ -159,14 +159,6 @@ int threei_register_handler(pid_t cageid, u32 syscall_nr, pid_t grateid,
 	threei_publish(cage, new);
 	task_unlock(cage);
 
-	{
-		struct threei_fdtable *table =
-			threei_fdtable_get_or_create(cage);
-		if (table) {
-			threei_vfd_install_stdio(table);
-		}
-	}
-
 	threei_set_cage_sched(cage);
 
 	threei_handler_put(old);

@@ -101,6 +101,7 @@ struct thread_info {
 #define TIF_SINGLESTEP		25	/* reenable singlestep on user return*/
 #define TIF_BLOCKSTEP		26	/* set when we want DEBUGCTLMSR_BTF */
 #define TIF_ADDR32		27	/* 32-bit address space on 64 bits */
+#define TIF_NOTIFY_THREEI	28	/* notify threei for a pending injection */
 
 #define _TIF_SSBD		BIT(TIF_SSBD)
 #define _TIF_SPEC_IB		BIT(TIF_SPEC_IB)
@@ -114,6 +115,7 @@ struct thread_info {
 #define _TIF_BLOCKSTEP		BIT(TIF_BLOCKSTEP)
 #define _TIF_SINGLESTEP		BIT(TIF_SINGLESTEP)
 #define _TIF_ADDR32		BIT(TIF_ADDR32)
+#define _TIF_NOTIFY_THREEI	BIT(TIF_NOTIFY_THREEI)
 
 /* flags to check in __switch_to() */
 #define _TIF_WORK_CTXSW_BASE					\
