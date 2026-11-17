@@ -1016,9 +1016,10 @@ asmlinkage long sys_copy_data_between_cages(pid_t src_cage,
                                             size_t len,
 					    unsigned long copytype);
 asmlinkage long sys_threei_recv(struct threei_req_user __user *req,
-                                unsigned int size);
+                                unsigned int size, pid_t cage_tid);
 asmlinkage long sys_threei_respond(u64 id, long retval);
 asmlinkage long sys_threei_grate_setup(void);
+asmlinkage long sys_threei_wait_spawn(void);
 #endif
 
 /*

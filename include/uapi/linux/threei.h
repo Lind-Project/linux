@@ -11,6 +11,7 @@ struct threei_req_user {
 	__u64	args[6];
 	__u64	handler_addr;
 	__s32	cage;
+	__u32   cage_cpu;
 	__u64	ring_uaddr;
 };
 

@@ -1624,6 +1624,10 @@ struct task_struct {
     struct threei_arena			*threei_arena;
     struct threei_request		*threei_fwd_req;
     struct threei_ctx_cache		*threei_ctx_cache;
+    struct threei_cage_queue		*threei_cage_queue;
+    struct task_struct			*threei_served;
+    struct threei_cage_queue		*threei_served_queue;
+    pid_t				threei_served_tid;
 #endif
 
 
