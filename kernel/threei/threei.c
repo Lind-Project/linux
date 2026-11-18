@@ -55,9 +55,13 @@ static void threei_ctx_free_rcu(struct rcu_head *rcu)
 {
 	struct threei_grate_ctx *ctx =
 		container_of(rcu, struct threei_grate_ctx, rcu);
+	struct threei_spawn_req *s, *t;
 
 	if (ctx->ring) {
 		free_pages((unsigned long)ctx->ring, ctx->ring_order);
+	}
+	list_for_each_entry_safe(s, t, &ctx->spawn_tids, node) {
+		kfree(s);
 	}
 	kfree(ctx);
 }
@@ -89,11 +93,9 @@ static struct threei_grate_ctx *grate_ctx_alloc(void)
 		return NULL;
 	}
 
-	spin_lock_init(&ctx->lock);
-	INIT_LIST_HEAD(&ctx->requests);
-	INIT_LIST_HEAD(&ctx->inflight);
-	init_waitqueue_head(&ctx->recv_wq);
-	atomic64_set(&ctx->next_id, 0);
+	spin_lock_init(&ctx->spawn_lock);
+	INIT_LIST_HEAD(&ctx->spawn_tids);
+	init_waitqueue_head(&ctx->spawn_wq);
 	refcount_set(&ctx->refs, 1);
 
 	return ctx;
@@ -128,30 +130,6 @@ static struct threei_grate_ctx *grate_ctx_get(struct task_struct *grate)
 	rcu_assign_pointer(grate->threei_grate_ctx, fresh);
 	task_unlock(grate);
 	return fresh;
-}
-
-static bool has_pending(struct threei_grate_ctx *ctx)
-{
-	bool ret;
-
-	spin_lock(&ctx->lock);
-	ret = !list_empty(&ctx->requests);
-	spin_unlock(&ctx->lock);
-	return ret;
-}
-
-static struct threei_request *find_inflight(struct threei_grate_ctx *ctx,
-					    u64 id)
-{
-	struct threei_request *req;
-
-	list_for_each_entry(req, &ctx->inflight, node) {
-		if (req->id == id) {
-			return req;
-		}
-	}
-
-	return NULL;
 }
 
 static struct threei_grate_ctx *threei_resolve_ctx(pid_t grateid)
@@ -280,6 +258,126 @@ static inline bool threei_slot_reclaim(struct threei_ring *ring, int idx)
 	return true;
 }
 
+static struct threei_cage_queue *threei_cq_alloc(void)
+{
+	struct threei_cage_queue *queue;
+
+	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
+
+	if (!queue) {
+		return NULL;
+	}
+	spin_lock_init(&queue->lock);
+	INIT_LIST_HEAD(&queue->requests);
+	INIT_LIST_HEAD(&queue->inflight);
+	init_waitqueue_head(&queue->recv_wq);
+	refcount_set(&queue->refs, 1);
+
+	return queue;
+}
+
+static void threei_cq_free_rcu(struct rcu_head *rcu)
+{
+	kfree(container_of(rcu, struct threei_cage_queue, rcu));
+}
+
+static void threei_cq_put(struct threei_cage_queue *queue)
+{
+	if (queue && refcount_dec_and_test(&queue->refs)) {
+		call_rcu(&queue->rcu, threei_cq_free_rcu);
+	}
+}
+
+static struct threei_cage_queue *
+threei_cq_tryget(struct threei_cage_queue *queue)
+{
+	return (queue && refcount_inc_not_zero(&queue->refs)) ? queue : NULL;
+}
+
+static struct threei_cage_queue *threei_cq_get(struct task_struct *task)
+{
+	struct threei_cage_queue *queue, *fresh;
+
+	rcu_read_lock();
+	queue = threei_cq_tryget(rcu_dereference(task->threei_cage_queue));
+	rcu_read_unlock();
+	if (queue) {
+		return queue;
+	}
+
+	if (task->flags & PF_EXITING) {
+		return NULL;
+	}
+
+	fresh = threei_cq_alloc();
+	if (!fresh) {
+		return NULL;
+	}
+
+	task_lock(task);
+	queue = rcu_dereference_protected(task->threei_cage_queue,
+					  lockdep_is_held(&task->alloc_lock));
+	if (queue) {
+		threei_cq_tryget(queue);
+		task_unlock(task);
+		kfree(fresh);
+		return queue;
+	}
+	if (task->flags & PF_EXITING) {
+		task_unlock(task);
+		kfree(fresh);
+		return NULL;
+	}
+	refcount_inc(&fresh->refs);
+	rcu_assign_pointer(task->threei_cage_queue, fresh);
+	task_unlock(task);
+	return fresh;
+}
+
+static struct threei_request *threei_cq_find(struct threei_cage_queue *queue,
+					     u64 id)
+{
+	struct threei_request *req;
+
+	list_for_each_entry(req, &queue->inflight, node) {
+		if (req->id == id) {
+			return req;
+		}
+	}
+	return NULL;
+}
+
+static bool threei_cq_has_pending(struct threei_cage_queue *queue)
+{
+	bool req;
+
+	spin_lock(&queue->lock);
+	req = !list_empty(&queue->requests);
+	spin_unlock(&queue->lock);
+
+	return req;
+}
+
+static void threei_request_servicer(struct threei_grate_ctx *ctx, pid_t tid)
+{
+	struct threei_spawn_req *serv = kmalloc(sizeof(*serv), GFP_KERNEL);
+
+	if (!serv) {
+		return;
+	}
+
+	serv->tid = tid;
+	spin_lock(&ctx->spawn_lock);
+	if (READ_ONCE(ctx->dead)) {
+		spin_unlock(&ctx->spawn_lock);
+		kfree(serv);
+		return;
+	}
+	list_add_tail(&serv->node, &ctx->spawn_tids);
+	spin_unlock(&ctx->spawn_lock);
+	wake_up(&ctx->spawn_wq);
+}
+
 /* fast path: shared-ring spin
  *
  * Try to forward via the shared ring. Returns true if the ring path was
@@ -305,6 +403,10 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 	struct threei_ring_slot *slot = NULL;
 	int slot_idx, spins;
 	bool grate_claimed = false;
+
+	if (get_nr_threads(current) != 1) {
+		return false;
+	}
 
 	if (!ring || !ctx->ring_uaddr) {
 		return false;
@@ -384,7 +486,8 @@ static bool forward_via_ring(struct threei_grate_ctx *ctx,
 			if (local_clock() > deadline) {
 				if (threei_slot_reclaim(ring, slot_idx)) {
 					/* reclaimed: the grate never saw it. safe to resubmit */
-					WRITE_ONCE(current->threei_fwd_req, NULL);
+					WRITE_ONCE(current->threei_fwd_req,
+						   NULL);
 					return false; /* forward_via_completion */
 				}
 				grate_claimed = true;
@@ -414,10 +517,15 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
 				   pid_t primary_cage, unsigned long args[6])
 {
 	struct threei_request req;
+	struct threei_cage_queue *queue;
 	long ret;
 
+	queue = threei_cq_get(current);
+	if (!queue) {
+		return -ESRCH;
+	}
+
 	memset(&req, 0, sizeof(req));
-	req.id = atomic64_inc_return(&ctx->next_id);
 	req.nr = nr;
 	req.handler_addr = handler->handler_addr;
 	req.cage = primary_cage;
@@ -425,14 +533,20 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
 	init_completion(&req.done);
 	req.completed = false;
 
-	spin_lock(&ctx->lock);
-	if (ctx->dead) {
-		spin_unlock(&ctx->lock);
+	spin_lock(&queue->lock);
+	if (READ_ONCE(queue->dead) || READ_ONCE(ctx->dead)) {
+		spin_unlock(&queue->lock);
+		threei_cq_put(queue);
 		return -ESRCH;
 	}
-	list_add_tail(&req.node, &ctx->requests);
-	spin_unlock(&ctx->lock);
-	wake_up_interruptible_sync(&ctx->recv_wq);
+	req.id = queue->seq++;
+	list_add_tail(&req.node, &queue->requests);
+	spin_unlock(&queue->lock);
+	wake_up_interruptible_sync(&queue->recv_wq);
+
+	if (!READ_ONCE(queue->has_servicer)) {
+		threei_request_servicer(ctx, task_pid_vnr(current));
+	}
 
 	/* publish the live request so threei_inject_call() can wake this exact
 	 * wait with a plain complete(&req.done), no signal required.*/
@@ -450,34 +564,54 @@ static long forward_via_completion(struct threei_grate_ctx *ctx,
 			break;
 		}
 
+		/* grate terminated while we blocked */
+		if (READ_ONCE(ctx->dead)) {
+			spin_lock(&queue->lock);
+			if (!req.completed) {
+				list_del(&req.node);
+			}
+			spin_unlock(&queue->lock);
+			WRITE_ONCE(current->threei_fwd_req, NULL);
+			threei_cq_put(queue);
+			return -ESRCH;
+		}
+
 		/* woken without a response: either the injection nudge (a plain
 		 * complete() from threei_inject_call, no signal) or the poll-timeout
 		 * backstop. service a pending injection in the cage's own context. */
 		if (threei_drain_injection(nr, args, &run_native) &&
-			run_native) {
+		    run_native) {
+			bool owned;
+
 			WRITE_ONCE(current->threei_fwd_req, NULL);
-			spin_lock(&ctx->lock);
-			if (!req.completed) {
+			spin_lock(&queue->lock);
+			owned = !req.completed;
+			if (owned) {
 				list_del(&req.node);
 			}
-			spin_unlock(&ctx->lock);
-			return native_syscall(nr, args);
+			spin_unlock(&queue->lock);
+			threei_cq_put(queue);
+			if (owned) {
+				return native_syscall(nr, args);
+			}
+			return req.retval;
 		}
 
 		if (ret < 0 && test_thread_flag(TIF_SIGPENDING)) {
-			spin_lock(&ctx->lock);
+			spin_lock(&queue->lock);
 			if (!req.completed) {
 				list_del(&req.node);
-				spin_unlock(&ctx->lock);
+				spin_unlock(&queue->lock);
 				WRITE_ONCE(current->threei_fwd_req, NULL);
+				threei_cq_put(queue);
 				return -EINTR;
 			}
-			spin_unlock(&ctx->lock);
+			spin_unlock(&queue->lock);
 			break;
 		}
-
 	}
 	WRITE_ONCE(current->threei_fwd_req, NULL);
+	threei_cq_put(queue);
 	return req.retval;
 }
 
@@ -916,10 +1050,12 @@ SYSCALL_DEFINE0(threei_grate_setup)
 	return (long)uaddr;
 }
 
-SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
-		unsigned int, size)
+SYSCALL_DEFINE3(threei_recv, struct threei_req_user __user *, ureq,
+		unsigned int, size, pid_t, cage_tid)
 {
 	struct threei_grate_ctx *ctx;
+	struct task_struct *cage;
+	struct threei_cage_queue *queue;
 	struct threei_request *req;
 	struct threei_req_user out;
 	unsigned long ring_uaddr;
@@ -936,27 +1072,64 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
 	/* establish the ring on first recv (no-op afterwards) */
 	ring_uaddr = threei_create_ring(ctx);
 
+	/*
 	if (current->policy != SCHED_RR) {
 		threei_promote_grate(current);
 	}
+	*/
 
-	if (wait_event_interruptible(ctx->recv_wq,
-				     has_pending(ctx) || ctx->dead)) {
+	if (current->threei_served_tid != cage_tid) {
+		if (current->threei_served_queue) {
+			threei_cq_put(current->threei_served_queue);
+			current->threei_served_queue = NULL;
+		}
+		if (current->threei_served) {
+			put_task_struct(current->threei_served);
+			current->threei_served = NULL;
+		}
+		cage = find_get_task_by_vpid(cage_tid);
+		if (!cage) {
+			current->threei_served_tid = 0;
+			return -ESRCH;
+		}
+		queue = threei_cq_get(cage);
+		if (!queue) {
+			put_task_struct(cage);
+			current->threei_served_tid = 0;
+			return -ESRCH;
+		}
+		current->threei_served = cage;
+		current->threei_served_queue = queue;
+		current->threei_served_tid = cage_tid;
+	}
+	cage = current->threei_served;
+	queue = current->threei_served_queue;
+
+	WRITE_ONCE(queue->has_servicer, true);
+
+	if (wait_event_interruptible(queue->recv_wq,
+				     threei_cq_has_pending(queue) ||
+					     READ_ONCE(queue->dead) ||
+					     READ_ONCE(ctx->dead))) {
 		return -EINTR;
 	}
 
-	if (ctx->dead && !has_pending(ctx)) {
+	if (READ_ONCE(ctx->dead)) {
 		/*signal grate to exit*/
 		return -ENODEV;
 	}
+	if (READ_ONCE(queue->dead) && !threei_cq_has_pending(queue)) {
+		/* cage thread gone, so servicer exits */
+		return -ESRCH;
+	}
 
-	spin_lock(&ctx->lock);
-	req = list_first_entry_or_null(&ctx->requests, struct threei_request,
+	spin_lock(&queue->lock);
+	req = list_first_entry_or_null(&queue->requests, struct threei_request,
 				       node);
 	if (req) {
-		list_move_tail(&req->node, &ctx->inflight);
+		list_move_tail(&req->node, &queue->inflight);
 	}
-	spin_unlock(&ctx->lock);
+	spin_unlock(&queue->lock);
 	if (!req) {
 		return -EAGAIN;
 	}
@@ -966,6 +1139,7 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
 	out.nr = req->nr;
 	out.handler_addr = (unsigned long)req->handler_addr;
 	out.cage = req->cage;
+	out.cage_cpu = task_cpu(cage);
 	memcpy(out.args, req->args, sizeof(out.args));
 
 	if (copy_to_user(ureq, &out, min_t(unsigned int, size, sizeof(out)))) {
@@ -976,18 +1150,15 @@ SYSCALL_DEFINE2(threei_recv, struct threei_req_user __user *, ureq,
 
 SYSCALL_DEFINE2(threei_respond, u64, id, long, retval)
 {
-	struct threei_grate_ctx *ctx;
+	struct threei_cage_queue *queue = current->threei_served_queue;
 	struct threei_request *req;
 
-	rcu_read_lock();
-	ctx = rcu_dereference(current->group_leader->threei_grate_ctx);
-	rcu_read_unlock();
-	if (!ctx) {
+	if (!queue) {
 		return -EINVAL;
 	}
 
-	spin_lock(&ctx->lock);
-	req = find_inflight(ctx, id);
+	spin_lock(&queue->lock);
+	req = threei_cq_find(queue, id);
 	if (req) {
 		list_del(&req->node);
 		req->retval = retval;
@@ -995,9 +1166,43 @@ SYSCALL_DEFINE2(threei_respond, u64, id, long, retval)
 		/* wakes the blocked cage */
 		complete(&req->done);
 	}
-	spin_unlock(&ctx->lock);
+	spin_unlock(&queue->lock);
 
 	return req ? 0 : -ENOENT;
+}
+
+SYSCALL_DEFINE0(threei_wait_spawn)
+{
+	struct threei_grate_ctx *ctx = grate_ctx_get(current->group_leader);
+	struct threei_spawn_req *serv;
+	pid_t tid;
+
+	if (!ctx) {
+		return -ENOMEM;
+	}
+
+	if (wait_event_interruptible(ctx->spawn_wq,
+				     !list_empty_careful(&ctx->spawn_tids) ||
+					     READ_ONCE(ctx->dead))) {
+		return -EINTR;
+	}
+	if (READ_ONCE(ctx->dead)) {
+		return -ENODEV;
+	}
+
+	spin_lock(&ctx->spawn_lock);
+	serv = list_first_entry_or_null(&ctx->spawn_tids,
+					struct threei_spawn_req, node);
+	if (serv) {
+		list_del(&serv->node);
+	}
+	spin_unlock(&ctx->spawn_lock);
+	if (!serv) {
+		return -EAGAIN;
+	}
+	tid = serv->tid;
+	kfree(serv);
+	return tid;
 }
 
 /* LIFECYCLE HOOKS */
@@ -1012,6 +1217,10 @@ int copy_threei(struct task_struct *p)
 	p->threei_ctx_cache = NULL;
 	p->threei_ctx_borrow = NULL;
 	p->threei_arena = NULL;
+	p->threei_cage_queue = NULL;
+	p->threei_served = NULL;
+	p->threei_served_queue = NULL;
+	p->threei_served_tid = 0;
 
 	rcu_read_lock();
 	handler = rcu_dereference(current->threei_handler);
@@ -1042,8 +1251,6 @@ int copy_threei(struct task_struct *p)
 void threei_exit(struct task_struct *task)
 {
 	struct threei_grate_ctx *ctx = NULL;
-	struct threei_handler *handler;
-	struct task_struct *grate;
 	struct threei_inject *inj;
 
 	/*
@@ -1074,25 +1281,38 @@ void threei_exit(struct task_struct *task)
 	/* free cache for the cage */
 	threei_cache_free(task);
 
-	/* before dropping the table, find any registered grate and wake it */
-	rcu_read_lock();
-	handler = rcu_dereference(task->threei_handler);
-	if (handler) {
-		unsigned int nr;
-
-		for_each_set_bit(nr, handler->registered, NR_syscalls) {
-			grate = find_task_by_vpid(handler->table[nr].grateid);
-			if (grate) {
-				struct threei_grate_ctx *wctx = rcu_dereference(grate->threei_grate_ctx);
-				if (wctx) {
-					wake_up(&wctx->recv_wq);
-				}
-			}
-			/*one wake is enough*/
-			break;
-		}
+	if (task->threei_served_queue) {
+		threei_cq_put(task->threei_served_queue);
+		task->threei_served_queue = NULL;
 	}
-	rcu_read_unlock();
+	if (task->threei_served) {
+		put_task_struct(task->threei_served);
+		task->threei_served = NULL;
+	}
+
+	if (task->threei_cage_queue) {
+		struct threei_cage_queue *queue = task->threei_cage_queue;
+		struct threei_request *req, *tmp;
+
+		spin_lock(&queue->lock);
+		WRITE_ONCE(queue->dead, true);
+		list_for_each_entry_safe(req, tmp, &queue->requests, node) {
+			list_del(&req->node);
+			req->retval = -ESRCH;
+			req->completed = true;
+			complete(&req->done);
+		}
+		list_for_each_entry_safe(req, tmp, &queue->inflight, node) {
+			list_del(&req->node);
+			req->retval = -ESRCH;
+			req->completed = true;
+			complete(&req->done);
+		}
+		spin_unlock(&queue->lock);
+		wake_up_all(&queue->recv_wq);
+		rcu_assign_pointer(task->threei_cage_queue, NULL);
+		threei_cq_put(queue);
+	}
 
 	/* 1. Drop this task's interposition table (task-direct, no lookup). */
 	__drop_handlers(task);
@@ -1108,28 +1328,16 @@ void threei_exit(struct task_struct *task)
 	}
 
 	if (ctx) {
-		struct threei_request *req, *tmp;
+		struct threei_spawn_req *s, *t;
 
-		spin_lock(&ctx->lock);
-		ctx->dead = true;
-		/*
-		* Fail every request still pending or in flight: the grate is
-		* gone and will never respond, so unblock the waiting cages.
-		*/
-		list_for_each_entry_safe(req, tmp, &ctx->requests, node) {
-			list_del(&req->node);
-			req->retval = -ESRCH;
-			req->completed = true;
-			complete(&req->done);
+		spin_lock(&ctx->spawn_lock);
+		WRITE_ONCE(ctx->dead, true);
+		list_for_each_entry_safe(s, t, &ctx->spawn_tids, node) {
+			list_del(&s->node);
+			kfree(s);
 		}
-		list_for_each_entry_safe(req, tmp, &ctx->inflight, node) {
-			list_del(&req->node);
-			req->retval = -ESRCH;
-			req->completed = true;
-			complete(&req->done);
-		}
-		spin_unlock(&ctx->lock);
-
+		spin_unlock(&ctx->spawn_lock);
+		wake_up_all(&ctx->spawn_wq);
 		threei_ctx_put(ctx);
 	}
 }
