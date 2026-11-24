@@ -1153,6 +1153,7 @@ int begin_new_exec(struct linux_binprm * bprm)
 	bprm->mm = NULL;
 #ifdef CONFIG_THREEI
 	threei_exec_commit_notify();
+	threei_exec_copy_handlers();
 #endif
 
 	retval = exec_task_namespaces();

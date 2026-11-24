@@ -183,7 +183,6 @@ void rm_grate_from_handler(pid_t grateid);
 int threei_register_handler(pid_t cageid, u32 syscall_nr, pid_t grateid,
 			    void *in_grate_fn_addr);
 int deregister_handler(pid_t cageid, u32 syscall_nr);
-int copy_handler_table_to_cage(pid_t srccageid, pid_t targetcageid);
 
 bool threei_entry(u32 syscall_nr, unsigned long args[6], long *result);
 int copy_threei(struct task_struct *p);
@@ -206,6 +205,7 @@ bool threei_drain_injection(unsigned long self_nr, unsigned long args[6],
 			    bool *run_native);
 
 void threei_exec_commit_notify(void);
+void threei_exec_copy_handlers(void);
 
 unsigned long threei_arena_get(struct task_struct *cage, size_t need);
 void threei_arena_free(struct task_struct *task);

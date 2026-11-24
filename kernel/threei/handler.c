@@ -350,7 +350,7 @@ void rm_grate_from_handler(pid_t grateid)
 }
 
 /* clone one cage's table onto another */
-int copy_handler_table_to_cage(pid_t srccage, pid_t targetcage)
+static int threei_copy_handler_table_to_cage(pid_t srccage, pid_t targetcage)
 {
 	struct task_struct *src_task = NULL, *dst_task = NULL;
 	struct threei_handler *src, *new, *old;
@@ -414,9 +414,41 @@ out:
 	return ret;
 }
 
+void threei_exec_copy_handlers(void)
+{
+	struct task_struct *task = current;
+	struct threei_handler *old, *new;
+
+	rcu_read_lock();
+	old = rcu_dereference(task->threei_handler);
+	if (!old) {
+		rcu_read_unlock();
+		return;
+	}
+
+	new = threei_handler_clone(old, GFP_ATOMIC);
+	rcu_read_unlock();
+	if (!new) {
+		return;
+	}
+
+	task_lock(task);
+	old = rcu_dereference_protected(task->threei_handler,
+			lockdep_is_held(&task->alloc_lock));
+	threei_publish(task, new);
+	task_unlock(task);
+
+	threei_handler_put(old);
+}
+
 SYSCALL_DEFINE4(register_handler, pid_t, cageid, u32, syscall_nr, pid_t,
 		grateid, unsigned long, handler_addr)
 {
 	return threei_register_handler(cageid, syscall_nr, grateid,
 				       (void *)handler_addr);
+}
+
+SYSCALL_DEFINE2(copy_handler_table_to_cage, pid_t, srccage, pid_t, targetcage)
+{
+	return threei_copy_handler_table_to_cage(srccage, targetcage);
 }
