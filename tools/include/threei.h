@@ -55,6 +55,11 @@ static inline long copy_data_between_cages(pid_t src_cage,
 		       dst_cage, dst_addr, len, copytype);
 }
 
+static inline int copy_handler_table_to_cage(pid_t srccage, pid_t targetcage)
+{
+	return (int)syscall(__NR_copy_handler_table_to_cage, srccage, targetcage);
+}
+
 static inline int threei_recv(struct threei_req_user *req, pid_t cage_tid)
 {
 	return (int)syscall(__NR_threei_recv, req, sizeof(*req), cage_tid);
@@ -86,18 +91,6 @@ static inline long __threei_dispatch(struct threei_req_user *req)
 		  (unsigned long *)req->args);
 }
 
-static inline void __threei_handle_slot(struct threei_ring_slot *slot)
-{
-	threei_handler_fn fn =
-		(threei_handler_fn)(unsigned long)slot->handler_addr;
-	atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_CLAIMED,
-			      memory_order_release);
-	slot->retval = (long)fn((pid_t)slot->cage, (const int *)slot->arg_cage,
-				(unsigned long *)slot->args);
-
-	atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_DONE,
-			      memory_order_release);
-}
 
 static inline void __threei_pin_self(int cpu)
 {
@@ -229,6 +222,19 @@ static int register_handler(pid_t srccage, __u32 nr, pid_t dest_grate,
 #endif
 
 	return ret;
+}
+
+static inline void __threei_handle_slot(struct threei_ring_slot *slot)
+{
+	threei_handler_fn fn =
+		(threei_handler_fn)(unsigned long)slot->handler_addr;
+	atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_CLAIMED,
+			      memory_order_release);
+	slot->retval = (long)fn((pid_t)slot->cage, (const int *)slot->arg_cage,
+				(unsigned long *)slot->args);
+
+	atomic_store_explicit((atomic_uint *)&slot->state, THREEI_SLOT_DONE,
+			      memory_order_release);
 }
 
 static void *__threei_spin_loop(void *arg)
